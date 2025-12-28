@@ -763,22 +763,35 @@ def build_trt_engine(
 
 
 def prune_2to4_lastdim(w: torch.Tensor) -> torch.Tensor:
-    """Apply 2:4 structured sparsity along the last dimension (zero 2 smallest magnitudes in each 4-tuple)."""
-    if (not torch.is_tensor(w)) or w.ndim != 2 or (w.shape[-1] % 4) != 0:
+    """Apply 2:4 structured sparsity along the output (first) dimension.
+    
+    For nn.Linear.weight with shape [out_features, in_features], TensorRT's
+    sparse tensor cores expect 2:4 sparsity along the M (output) dimension.
+    We group every 4 output channels and zero the 2 smallest magnitudes.
+    """
+    if (not torch.is_tensor(w)) or w.ndim != 2 or (w.shape[0] % 4) != 0:
         return w
-    w2 = w.reshape(-1, 4)
-    _, idx = torch.topk(w2.abs(), k=2, dim=1, largest=False)
-    w2p = w2.clone()
-    w2p.scatter_(1, idx, 0)
-    return w2p.reshape_as(w)
+    # Reshape to [out//4, 4, in] to group along output dimension
+    out_dim, in_dim = w.shape
+    w4 = w.reshape(out_dim // 4, 4, in_dim)  # [out//4, 4, in]
+    # Find 2 smallest magnitudes along the group-of-4 dimension (dim=1)
+    _, idx = torch.topk(w4.abs(), k=2, dim=1, largest=False)  # [out//4, 2, in]
+    w4p = w4.clone()
+    w4p.scatter_(1, idx, 0)
+    return w4p.reshape_as(w)
 
 
 def fraction_groups_2to4(w: torch.Tensor) -> float:
-    """Fraction of 4-tuples having exactly 2 zeros."""
-    if (not torch.is_tensor(w)) or w.ndim != 2 or (w.shape[-1] % 4) != 0:
+    """Fraction of 4-tuples having exactly 2 zeros along output dimension.
+    
+    For nn.Linear.weight [out, in], checks sparsity pattern along the output
+    dimension to verify TensorRT 2:4 sparse tensor core compatibility.
+    """
+    if (not torch.is_tensor(w)) or w.ndim != 2 or (w.shape[0] % 4) != 0:
         return 0.0
-    w2 = w.reshape(-1, 4)
-    z = (w2 == 0).sum(dim=1)
+    out_dim, in_dim = w.shape
+    w4 = w.reshape(out_dim // 4, 4, in_dim)  # [out//4, 4, in]
+    z = (w4 == 0).sum(dim=1)  # [out//4, in] - count zeros in each group of 4
     return float((z == 2).float().mean().item())
 
 

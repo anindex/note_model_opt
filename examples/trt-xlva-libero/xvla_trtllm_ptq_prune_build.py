@@ -208,22 +208,26 @@ def sanitize_xvla_batch(model: nn.Module, batch: Dict[str, torch.Tensor]) -> Dic
 # -----------------------------
 
 def prune_2to4_lastdim(w: torch.Tensor) -> torch.Tensor:
+    """Apply 2:4 structured sparsity along the output (first) dimension.
+    
+    For nn.Linear.weight with shape [out_features, in_features], TensorRT's
+    sparse tensor cores expect 2:4 sparsity along the M (output) dimension.
+    We group every 4 output channels and zero the 2 smallest magnitudes.
+    """
     if w.numel() == 0:
         return w
-    if w.shape[-1] % 4 != 0:
-        raise ValueError("last dim not divisible by 4")
+    if w.ndim != 2 or (w.shape[0] % 4) != 0:
+        raise ValueError("weight must be 2D with first dim divisible by 4")
 
-    orig_shape = w.shape
-    w2 = w.reshape(-1, orig_shape[-1])              # [N, K]
-    K = w2.shape[-1]
-    w4 = w2.reshape(-1, K // 4, 4)                  # [N, K/4, 4]
+    out_dim, in_dim = w.shape
+    w4 = w.reshape(out_dim // 4, 4, in_dim)  # [out//4, 4, in]
 
-    # zero 2 smallest magnitude in each group of 4
-    idx = torch.argsort(w4.abs(), dim=-1)[..., :2]
+    # zero 2 smallest magnitude in each group of 4 along dim=1
+    idx = torch.argsort(w4.abs(), dim=1)[..., :2, :]  # [out//4, 2, in]
     mask = torch.ones_like(w4, dtype=torch.bool)
-    mask.scatter_(dim=-1, index=idx, value=False)
+    mask.scatter_(dim=1, index=idx, value=False)
     pruned = torch.where(mask, w4, torch.zeros_like(w4))
-    return pruned.reshape(orig_shape)
+    return pruned.reshape_as(w)
 
 
 @torch.inference_mode()

@@ -58,9 +58,9 @@ Important note:
 
 ```bash
 python dump_xvla_calib_from_hf_libero.py \
-  --baseline_id 2toINF/X-VLA-Libero \
+  --tokenizer_repo 2toINF/X-VLA-Libero \
   --out_dir ./xvla_calib_libero_hf \
-  --n_files 32
+  --n_batches 32
 ````
 
 This produces files like:
