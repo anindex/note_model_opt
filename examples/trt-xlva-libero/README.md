@@ -32,10 +32,15 @@ Different projects, GPU architectures, TensorRT versions, and deployment constra
 - `dump_xvla_calib_from_hf_libero.py`
   - Creates `.npz` calibration batches (input_ids, image_input, masks, etc).
 
-- `xvla_trtllm_ptq_prune_build.py`
-  - Pruning and PTQ build script with 2:4 pruning logic.
+- `xvla_trtllm_ptq_prune_build.py`  
+  Optimization build script that can:
+  - Apply optional **2:4 structured pruning**
+  - Run **ModelOpt PTQ** (FP8 or INT8) using offline `calib_*.npz`
   - **Using `--prune_semi_structured`** to convert pruned weights to PyTorch's compressed sparse format.
   - Note: it prunes `nn.Linear`, but X-VLA uses `DomainAwareLinear` heavily, so pruning must happen after domain specialization to affect the real GEMM weights.
+  - Export either:
+    - `transformer_state` mode (recommended for transformer only PTQ)
+    - `modelopt_plugin` mode (only for full model PTQ)
 
 ---
 
@@ -80,6 +85,9 @@ python xvla_trtllm_ptq_prune_build.py \
   --dtype bf16 \
   --do_prune --prune_scope transformer \
   --prune_semi_structured
+  --do_quant --quant fp8 --ptq_scope transformer \
+  --export_mode transformer_state \
+  --calib_max_files 16 --denoise_steps 1
 ```
 
 This uses PyTorch's `torch.sparse.to_sparse_semi_structured()` to store pruned weights in compressed format and enables efficient sparse GEMM kernels.
