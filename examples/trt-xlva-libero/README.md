@@ -31,9 +31,13 @@ Different projects, GPU architectures, TensorRT versions, and deployment constra
 - `dump_xvla_calib_from_hf_libero.py`
   - Creates `.npz` calibration batches (input_ids, image_input, masks, etc).
 
-- `xvla_trtllm_ptq_prune_build.py`
-  - Earlier pruning and PTQ build script. Useful reference for 2:4 pruning logic.
-  - Note: it prunes `nn.Linear`, but X-VLA uses `DomainAwareLinear` heavily, so pruning must happen after domain specialization to affect the real GEMM weights.
+- `xvla_trtllm_ptq_prune_build.py`  
+  Optimization build script that can:
+  - Apply optional **2:4 structured pruning**
+  - Run **ModelOpt PTQ** (FP8 or INT8) using offline `calib_*.npz`
+  - Export either:
+    - `transformer_state` mode (recommended for transformer only PTQ)
+    - `modelopt_plugin` mode (only for full model PTQ)
 
 ---
 
@@ -67,7 +71,22 @@ This produces files like:
 
 * `./xvla_calib_libero_hf/calib_00000.npz`
 
-### 2) Run the benchmark
+### 2) Run the Model Opt script
+
+```bash
+python xvla_trtllm_ptq_prune_build.py \
+  --model_id 2toINF/X-VLA-Libero \
+  --calib_dir ./xvla_calib_libero_hf \
+  --out_dir ./xvla_opt_out \
+  --dtype bf16 \
+  --do_prune --prune_scope transformer \
+  --do_quant --quant fp8 --ptq_scope transformer \
+  --export_mode transformer_state \
+  --calib_max_files 16 --denoise_steps 1
+```
+
+
+### 3) Run the benchmark
 
 ```bash
 python bench_xvla_variants.py \
@@ -82,7 +101,7 @@ python bench_xvla_variants.py \
   --iters 200 --warmup 20 --steps 1
 ```
 
-### 3) Build and benchmark TensorRT transformer
+### 4) Build and benchmark TensorRT transformer
 
 Dense transformer engine:
 
