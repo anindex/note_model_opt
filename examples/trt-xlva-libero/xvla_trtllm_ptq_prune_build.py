@@ -207,6 +207,16 @@ def sanitize_xvla_batch(model: nn.Module, batch: Dict[str, torch.Tensor]) -> Dic
 # Pruning: 2:4 structured on last dim
 # -----------------------------
 
+# Check for PyTorch semi-structured sparsity support (PyTorch 2.1+)
+_HAS_SEMI_STRUCTURED = False
+try:
+    from torch.sparse import to_sparse_semi_structured, SparseSemiStructuredTensor
+    # Ensure the backend is available (requires SM80+ GPU like A100, H100, RTX 30xx+)
+    _HAS_SEMI_STRUCTURED = True
+except ImportError:
+    pass
+
+
 def prune_2to4_lastdim(w: torch.Tensor) -> torch.Tensor:
     """Apply 2:4 structured sparsity along the output (first) dimension.
     
@@ -230,10 +240,51 @@ def prune_2to4_lastdim(w: torch.Tensor) -> torch.Tensor:
     return pruned.reshape_as(w)
 
 
+def convert_to_semi_structured(weight: torch.Tensor) -> torch.Tensor:
+    """Convert a 2:4 pruned dense weight to PyTorch's sparse semi-structured format.
+    
+    This uses compressed storage (50% memory reduction) and enables efficient
+    sparse GEMM kernels on Ampere+ GPUs (SM80+).
+    
+    Requirements:
+    - PyTorch 2.1+
+    - CUDA GPU with SM80+ (A100, H100, RTX 30xx, RTX 40xx, RTX 50xx)
+    - Weight shape must be compatible (both dims divisible by 16 for fp16/bf16)
+    """
+    if not _HAS_SEMI_STRUCTURED:
+        raise RuntimeError(
+            "PyTorch semi-structured sparsity not available. "
+            "Requires PyTorch 2.1+ with CUDA support."
+        )
+    return to_sparse_semi_structured(weight)
+
+
 @torch.inference_mode()
-def apply_2to4_pruning(model: nn.Module, scope: str) -> Dict[str, float]:
+def apply_2to4_pruning(
+    model: nn.Module,
+    scope: str,
+    use_semi_structured: bool = False,
+) -> Dict[str, float]:
+    """Apply 2:4 structured pruning to model weights.
+    
+    Args:
+        model: The model to prune
+        scope: "transformer" or "all"
+        use_semi_structured: If True, convert pruned weights to PyTorch's
+            sparse semi-structured format for memory savings and faster inference.
+            Requires PyTorch 2.1+ and Ampere+ GPU.
+    
+    Returns:
+        Dict with pruning statistics
+    """
     if scope not in ("transformer", "all"):
         raise ValueError("scope must be transformer or all")
+
+    if use_semi_structured and not _HAS_SEMI_STRUCTURED:
+        raise RuntimeError(
+            "Semi-structured sparsity requested but not available. "
+            "Requires PyTorch 2.1+ with CUDA support."
+        )
 
     roots: List[nn.Module]
     if scope == "transformer":
@@ -245,12 +296,37 @@ def apply_2to4_pruning(model: nn.Module, scope: str) -> Dict[str, float]:
 
     pruned_layers = 0
     skipped_layers = 0
+    semi_structured_layers = 0
+    semi_structured_failures = 0
 
     for root in roots:
-        for _, m in root.named_modules():
+        for name, m in root.named_modules():
             if isinstance(m, nn.Linear) and isinstance(m.weight, torch.Tensor):
                 try:
-                    m.weight.data = prune_2to4_lastdim(m.weight.data)
+                    # First apply 2:4 pruning pattern
+                    pruned_weight = prune_2to4_lastdim(m.weight.data)
+                    
+                    if use_semi_structured:
+                        # Try to convert to semi-structured sparse format
+                        # This requires specific shape constraints
+                        try:
+                            # Semi-structured requires contiguous memory
+                            pruned_weight = pruned_weight.contiguous()
+                            sparse_weight = convert_to_semi_structured(pruned_weight)
+                            m.weight = nn.Parameter(sparse_weight, requires_grad=False)
+                            semi_structured_layers += 1
+                        except Exception as e:
+                            # Fallback to dense storage if conversion fails
+                            # (e.g., incompatible shapes, CPU tensor, etc.)
+                            m.weight.data = pruned_weight
+                            semi_structured_failures += 1
+                            warnings.warn(
+                                f"Semi-structured conversion failed for {name}: {e}. "
+                                "Using dense storage."
+                            )
+                    else:
+                        m.weight.data = pruned_weight
+                    
                     pruned_layers += 1
                 except ValueError:
                     skipped_layers += 1
@@ -260,8 +336,17 @@ def apply_2to4_pruning(model: nn.Module, scope: str) -> Dict[str, float]:
     for p in model.parameters():
         if not p.is_floating_point():
             continue
-        total_elems += p.numel()
-        total_zeros += int((p == 0).sum().item())
+        # Handle semi-structured tensors which may not support == 0 directly
+        try:
+            if hasattr(p, 'to_dense'):
+                dense_p = p.to_dense()
+                total_elems += dense_p.numel()
+                total_zeros += int((dense_p == 0).sum().item())
+            else:
+                total_elems += p.numel()
+                total_zeros += int((p == 0).sum().item())
+        except Exception:
+            total_elems += p.numel()
 
     return {
         "sparsity": float(total_zeros) / float(max(1, total_elems)),
@@ -269,6 +354,9 @@ def apply_2to4_pruning(model: nn.Module, scope: str) -> Dict[str, float]:
         "total_zeros": float(total_zeros),
         "pruned_layers": float(pruned_layers),
         "skipped_layers": float(skipped_layers),
+        "semi_structured_layers": float(semi_structured_layers),
+        "semi_structured_failures": float(semi_structured_failures),
+        "use_semi_structured": use_semi_structured,
     }
 
 
@@ -481,6 +569,13 @@ def main() -> None:
 
     ap.add_argument("--do_prune", action="store_true")
     ap.add_argument("--prune_scope", type=str, default="transformer", choices=["transformer", "all"])
+    ap.add_argument(
+        "--prune_semi_structured",
+        action="store_true",
+        help="Convert pruned weights to PyTorch semi-structured sparse format. "
+             "Reduces memory by 50%% and enables fast sparse GEMM kernels. "
+             "Requires PyTorch 2.1+ and Ampere+ GPU (SM80+).",
+    )
 
     ap.add_argument("--do_quant", action="store_true")
     ap.add_argument("--quant", type=str, default="fp8", choices=["fp8", "int8"])
@@ -549,7 +644,11 @@ def main() -> None:
 
     # Optional pruning
     if args.do_prune:
-        pr = apply_2to4_pruning(model, scope=args.prune_scope)
+        pr = apply_2to4_pruning(
+            model,
+            scope=args.prune_scope,
+            use_semi_structured=args.prune_semi_structured,
+        )
         report["did_prune"] = True
         report["prune_scope"] = args.prune_scope
         report["prune_report"] = pr

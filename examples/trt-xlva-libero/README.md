@@ -2,15 +2,16 @@
 
 This folder contains a small example pipeline to benchmark and improve inference latency for **2toINF/X-VLA-Libero**, with:
 - PyTorch baseline timing
-- “Pruned” HF checkpoint timing (dense zeros, PyTorch)
+- "Pruned" HF checkpoint timing (with optional semi-structured sparse storage)
 - ModelOpt FP8 transformer only timing (PyTorch)
 - TensorRT engine build and transformer timing
-- Optional “2:4 pruning at export time” to test TensorRT sparse tactics on a domain-specialized transformer
+- Optional "2:4 pruning at export time" to test TensorRT sparse tactics on a domain-specialized transformer
 
 The main takeaway from this trial model opt run so far:
 - TensorRT gives a strong speedup on the transformer portion.
 - End to end latency is dominated by the VLM part, so overall gains are capped unless VLM is accelerated.
 - 2:4 sparsity, even with 2:4 compliant weights, did not help on our current setup, it was slightly worse when sparse tactics were enabled.
+- PyTorch semi-structured sparsity (2.1+) can reduce memory for pruned weights and enable faster sparse GEMM kernels on Ampere+ GPUs.
 
 ## Important note on scope and intent
 
@@ -32,7 +33,8 @@ Different projects, GPU architectures, TensorRT versions, and deployment constra
   - Creates `.npz` calibration batches (input_ids, image_input, masks, etc).
 
 - `xvla_trtllm_ptq_prune_build.py`
-  - Earlier pruning and PTQ build script. Useful reference for 2:4 pruning logic.
+  - Pruning and PTQ build script with 2:4 pruning logic.
+  - **Using `--prune_semi_structured`** to convert pruned weights to PyTorch's compressed sparse format.
   - Note: it prunes `nn.Linear`, but X-VLA uses `DomainAwareLinear` heavily, so pruning must happen after domain specialization to affect the real GEMM weights.
 
 ---
@@ -42,10 +44,11 @@ Different projects, GPU architectures, TensorRT versions, and deployment constra
 Typical stack:
 - Python 3.10
 - `lerobot` with `libero` and `xvla`
-- PyTorch 2.3 or newer
+- PyTorch 2.3 or newer (2.1+ required for semi-structured sparsity)
 - TensorRT 10 or newer (the script supports TRT 8/9 and 10+ APIs)
 - CUDA toolkit matching our PyTorch and TRT builds
 - `nvidia-modelopt` for FP8 quant state
+- Ampere+ GPU (SM80+: A100, H100, RTX 30xx/40xx/50xx) for semi-structured sparse GEMM acceleration
 
 Important note:
 - You will see `transformers==4.49.0` warning from `nvidia-modelopt`. That does not always break things, but mismatches can reduce stability.
@@ -67,7 +70,21 @@ This produces files like:
 
 * `./xvla_calib_libero_hf/calib_00000.npz`
 
-### 2) Run the benchmark
+### 2) Build pruned checkpoint with semi-structured sparsity (memory-efficient)
+
+```bash
+python xvla_trtllm_ptq_prune_build.py \
+  --model_id 2toINF/X-VLA-Libero \
+  --calib_dir ./xvla_calib_libero_hf \
+  --out_dir ./xvla_opt_out \
+  --dtype bf16 \
+  --do_prune --prune_scope transformer \
+  --prune_semi_structured
+```
+
+This uses PyTorch's `torch.sparse.to_sparse_semi_structured()` to store pruned weights in compressed format and enables efficient sparse GEMM kernels.
+
+### 3) Run the benchmark
 
 ```bash
 python bench_xvla_variants.py \
@@ -82,7 +99,7 @@ python bench_xvla_variants.py \
   --iters 200 --warmup 20 --steps 1
 ```
 
-### 3) Build and benchmark TensorRT transformer
+### 4) Build and benchmark TensorRT transformer
 
 Dense transformer engine:
 
@@ -170,7 +187,7 @@ VLM share is about:
 
 This means even a huge policy speedup can only reduce end to end by so much, because VLM is the bottleneck.
 
-### 2) “Pruned” PyTorch checkpoint does not help
+### 2) "Pruned" PyTorch checkpoint does not help (without semi-structured)
 
 our `pruned` variant is slightly worse than baseline and uses much more memory:
 
@@ -178,6 +195,11 @@ our `pruned` variant is slightly worse than baseline and uses much more memory:
 * peak memory jumps from ~1.9 GB to ~3.6 GB
 
 This is expected if pruning is represented as dense weights with zeros, PyTorch does not automatically accelerate dense GEMMs with zero patterns, and additional wrappers or non-fused paths can increase memory.
+
+ Use `--prune_semi_structured` to enable PyTorch's semi-structured sparsity:
+- Stores 2:4 pruned weights in compressed format (50% memory reduction for weight storage)
+- Enables efficient sparse GEMM kernels via CUTLASS on Ampere+ GPUs
+- Requires PyTorch 2.1+ and SM80+ GPU (A100, H100, RTX 30xx/40xx/50xx)
 
 Conclusion:
 
