@@ -11,24 +11,49 @@ This folder contains a small  example harness that benchmarks **`typecast-xvla-l
 
 1. Clone and install LeRobot with LIBERO and X-VLA extras:
 
+Follow official [installation instructions](https://huggingface.co/docs/lerobot/en/installation). Then:
+
 ```bash
 git clone https://github.com/huggingface/lerobot.git
 cd lerobot
 
 # Install LeRobot in editable mode + required extras
+pip install -e .
 pip install -e ".[libero]"
 pip install -e ".[xvla]"
-````
+```
+
+If you have trouble with install LIBERO dataset due to `cmake`, do:
+
+```bash
+export CMAKE_POLICY_VERSION_MINIMUM=3.5
+pip install libero --use-pep517 --no-build-isolation
+```
 
 2. LIBERO assets and environment setup
 
 Follow LeRobot’s LIBERO setup (datasets, assets) as you normally do for `lerobot-eval`. If you already can run:
 
 ```bash
-lerobot-eval --env.type=libero --env.task=libero_spatial
+export MUJOCO_GL=egl
+
+lerobot-eval \
+  --policy.path="lerobot/xvla-libero" \
+  --env.type=libero \
+  --env.task=libero_spatial \
+  --env.control_mode=absolute \
+  --eval.batch_size=1 \
+  --eval.n_episodes=1 \
+  --env.episode_length=800 \
+  --seed=142
 ```
 
 then you are good.
+
+If you have newer Nvidia GPU families, consider:
+```bash
+pip3 install --upgrade torch torchvision
+```
 
 3. Headless rendering
 
@@ -56,6 +81,7 @@ From the directory where `xvla_libero_bench.py` lives:
 
 ```bash
 export MUJOCO_GL=egl
+export TOKENIZERS_PARALLELISM=false
 
 python xvla_libero_bench.py \
   --output_root ./bench_xvla_libero \

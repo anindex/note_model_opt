@@ -31,6 +31,9 @@ class RunResult:
     episodes_per_s: Optional[float]
     approx_steps_per_s: Optional[float]
     success_rate: Optional[float]
+    policy_latency_mean_ms: Optional[float]
+    policy_latency_p50_ms: Optional[float]
+    policy_latency_p90_ms: Optional[float]
     details_path: str
     stdout_tail: str
     stderr_tail: str
@@ -127,40 +130,42 @@ try:
 
     atexit.register(_dump_latency)
 
+    # Determine AMP dtype if specified
+    amp_torch_dtype = None
     if amp_dtype:
         if amp_dtype == "bfloat16":
             amp_torch_dtype = torch.bfloat16
         elif amp_dtype == "float16":
             amp_torch_dtype = torch.float16
-        else:
-            amp_torch_dtype = None
 
-        if amp_torch_dtype is not None:
-            try:
-                from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
+    # Always wrap select_action for latency timing, optionally with AMP
+    try:
+        from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
 
-                orig = XVLAPolicy.select_action
+        orig = XVLAPolicy.select_action
 
-                def wrapped(self, obs):
-                    ctx = nullcontext()
-                    if torch.cuda.is_available():
-                        ctx = torch.autocast(device_type="cuda", dtype=amp_torch_dtype)
+        def wrapped(self, obs):
+            # Use AMP context only if dtype is specified
+            if amp_torch_dtype is not None and torch.cuda.is_available():
+                ctx = torch.autocast(device_type="cuda", dtype=amp_torch_dtype)
+            else:
+                ctx = nullcontext()
 
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    t0 = time.perf_counter()
-                    with ctx:
-                        out = orig(self, obs)
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    t1 = time.perf_counter()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            with ctx:
+                out = orig(self, obs)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t1 = time.perf_counter()
 
-                    lat_ms.append((t1 - t0) * 1000.0)
-                    return out
+            lat_ms.append((t1 - t0) * 1000.0)
+            return out
 
-                XVLAPolicy.select_action = wrapped
-            except Exception:
-                pass
+        XVLAPolicy.select_action = wrapped
+    except Exception:
+        pass
 
 except Exception:
     pass
@@ -280,6 +285,21 @@ def _parse_success_rate(out_dir: Path) -> Tuple[Optional[float], List[str]]:
     return None, notes
 
 
+def _parse_policy_latency(out_dir: Path) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Parse policy_latency.json and return (mean_ms, p50_ms, p90_ms)."""
+    latency_file = out_dir / "policy_latency.json"
+    if not latency_file.exists():
+        return None, None, None
+    data = _load_json(latency_file)
+    if not data or not isinstance(data, dict):
+        return None, None, None
+    return (
+        data.get("mean_ms"),
+        data.get("p50_ms"),
+        data.get("p90_ms"),
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--output_root", type=str, default="./bench_xvla_libero")
@@ -362,6 +382,9 @@ def main() -> int:
         steps_total = args.n_episodes * args.episode_length
         steps_per_s = (steps_total / wall) if wall > 0 else None
 
+        # Parse policy latency from the injected timing wrapper
+        lat_mean, lat_p50, lat_p90 = _parse_policy_latency(run_dir) if ok else (None, None, None)
+
         res = RunResult(
             name=spec.name,
             ok=ok,
@@ -370,6 +393,9 @@ def main() -> int:
             episodes_per_s=eps_per_s,
             approx_steps_per_s=steps_per_s,
             success_rate=success_rate,
+            policy_latency_mean_ms=lat_mean,
+            policy_latency_p50_ms=lat_p50,
+            policy_latency_p90_ms=lat_p90,
             details_path=str(run_dir),
             stdout_tail=_tail(out),
             stderr_tail=_tail(err),
@@ -391,6 +417,9 @@ def main() -> int:
                 "episodes_per_s",
                 "approx_steps_per_s",
                 "success_rate",
+                "policy_latency_mean_ms",
+                "policy_latency_p50_ms",
+                "policy_latency_p90_ms",
                 "details_path",
             ],
         )
@@ -405,6 +434,9 @@ def main() -> int:
                     "episodes_per_s": "" if r.episodes_per_s is None else f"{r.episodes_per_s:.6f}",
                     "approx_steps_per_s": "" if r.approx_steps_per_s is None else f"{r.approx_steps_per_s:.3f}",
                     "success_rate": "" if r.success_rate is None else f"{r.success_rate:.4f}",
+                    "policy_latency_mean_ms": "" if r.policy_latency_mean_ms is None else f"{r.policy_latency_mean_ms:.3f}",
+                    "policy_latency_p50_ms": "" if r.policy_latency_p50_ms is None else f"{r.policy_latency_p50_ms:.3f}",
+                    "policy_latency_p90_ms": "" if r.policy_latency_p90_ms is None else f"{r.policy_latency_p90_ms:.3f}",
                     "details_path": r.details_path,
                 }
             )
@@ -412,17 +444,25 @@ def main() -> int:
     print("\n\n=== SUMMARY ===")
     baseline = next((r for r in results if r.name == "baseline_fp32" and r.ok), None)
     for r in results:
-        speedup = None
+        # Wall time speedup
+        wall_speedup = None
         if baseline and baseline.wall_s > 0 and r.wall_s > 0 and r.ok:
-            speedup = baseline.wall_s / r.wall_s
+            wall_speedup = baseline.wall_s / r.wall_s
+
+        # Policy latency speedup (more accurate for model performance)
+        lat_speedup = None
+        if (baseline and baseline.policy_latency_mean_ms and baseline.policy_latency_mean_ms > 0
+                and r.policy_latency_mean_ms and r.policy_latency_mean_ms > 0 and r.ok):
+            lat_speedup = baseline.policy_latency_mean_ms / r.policy_latency_mean_ms
 
         succ = "" if r.success_rate is None else f"{r.success_rate:.3f}"
-        spd = "" if speedup is None else f"{speedup:.2f}x"
+        wall_spd = "" if wall_speedup is None else f"{wall_speedup:.2f}x"
+        lat_spd = "" if lat_speedup is None else f"{lat_speedup:.2f}x"
+        lat_ms = "" if r.policy_latency_mean_ms is None else f"{r.policy_latency_mean_ms:.1f}"
         print(
-            f"{r.name:>20} | ok={str(r.ok):5} | wall={r.wall_s:7.2f}s"
-            f" | eps/s={(r.episodes_per_s or 0):7.4f}"
-            f" | steps/s~={(r.approx_steps_per_s or 0):8.1f}"
-            f" | succ={succ:>6} | speedup={spd:>6}"
+            f"{r.name:>25} | ok={str(r.ok):5} | wall={r.wall_s:7.2f}s"
+            f" | lat_ms={lat_ms:>7}"
+            f" | succ={succ:>6} | wall_spd={wall_spd:>6} | lat_spd={lat_spd:>6}"
         )
 
     print(f"\nWrote: {results_jsonl}")
