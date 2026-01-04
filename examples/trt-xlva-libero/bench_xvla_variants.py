@@ -16,6 +16,87 @@ from transformers import AutoModel
 
 
 # ----------------------------
+# Semi-structured sparse support
+# ----------------------------
+
+def is_semi_structured_available() -> bool:
+    """Check if PyTorch semi-structured sparsity is available."""
+    try:
+        from torch.sparse import to_sparse_semi_structured, SparseSemiStructuredTensor
+        return True
+    except ImportError:
+        return False
+
+
+def convert_to_semi_structured(model: nn.Module, scope: str = "transformer") -> Dict[str, Any]:
+    """
+    Convert 2:4 pruned dense weights to SparseSemiStructuredTensor format for hardware acceleration.
+    
+    The pruned model was saved with dense tensors (for safetensors compatibility).
+    This function converts them back to semi-structured format at runtime to benefit
+    from cuSPARSELt acceleration on Ampere+ GPUs.
+    
+    Args:
+        model: The model with pruned weights (loaded as dense)
+        scope: "transformer" or "all"
+        
+    Returns:
+        dict with conversion statistics
+    """
+    if not is_semi_structured_available():
+        return {"error": "Semi-structured sparsity not available in this PyTorch version"}
+    
+    from torch.sparse import to_sparse_semi_structured
+    
+    target = model.transformer if (scope == "transformer" and hasattr(model, "transformer")) else model
+    
+    converted = 0
+    skipped = 0
+    not_24_sparse = 0
+    
+    for name, module in target.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        
+        w = module.weight.data
+        
+        # Semi-structured requires fp16 or bf16
+        if w.dtype not in (torch.float16, torch.bfloat16):
+            skipped += 1
+            continue
+        
+        # Check if weight has 2:4 sparsity pattern (K dimension must be divisible by 4)
+        # Weight shape is [out_features, in_features] = [M, K]
+        K = w.shape[1]
+        if K % 4 != 0:
+            skipped += 1
+            continue
+        
+        # Check if actually has 2:4 pattern
+        w_reshaped = w.view(-1, 4)  # Reshape to groups of 4 along K
+        zeros_per_group = (w_reshaped == 0).sum(dim=1)
+        # 2:4 means exactly 2 zeros per group of 4
+        if not (zeros_per_group == 2).all():
+            not_24_sparse += 1
+            continue
+        
+        # Convert to semi-structured
+        try:
+            sparse_w = to_sparse_semi_structured(w)
+            module.weight = nn.Parameter(sparse_w, requires_grad=False)
+            converted += 1
+        except Exception as e:
+            skipped += 1
+    
+    return {
+        "converted": converted,
+        "skipped": skipped,
+        "not_24_sparse": not_24_sparse,
+        "semi_structured_enabled": converted > 0,
+    }
+
+
+# ----------------------------
 # IO
 # ----------------------------
 
@@ -278,7 +359,8 @@ def restore_transformer_modelopt_state(model: nn.Module, state_path: Path) -> No
 
     if not state_path.exists():
         raise FileNotFoundError(f"Missing transformer ModelOpt state: {state_path}")
-    state = torch.load(state_path, map_location="cpu")
+    # Use weights_only=False since ModelOpt state may contain non-tensor objects
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
     if not hasattr(model, "transformer"):
         raise AttributeError("Model has no .transformer, cannot restore transformer-only state")
     mto.restore_from_modelopt_state(model.transformer, state)
@@ -763,35 +845,37 @@ def build_trt_engine(
 
 
 def prune_2to4_lastdim(w: torch.Tensor) -> torch.Tensor:
-    """Apply 2:4 structured sparsity along the output (first) dimension.
+    """Apply 2:4 structured sparsity along the input (last/K) dimension.
     
     For nn.Linear.weight with shape [out_features, in_features], TensorRT's
-    sparse tensor cores expect 2:4 sparsity along the M (output) dimension.
-    We group every 4 output channels and zero the 2 smallest magnitudes.
+    sparse tensor cores expect 2:4 sparsity along the K (in_features) dimension.
+    PyTorch's semi-structured sparsity also requires this pattern.
+    
+    We group every 4 input features and zero the 2 smallest magnitudes.
     """
-    if (not torch.is_tensor(w)) or w.ndim != 2 or (w.shape[0] % 4) != 0:
+    if (not torch.is_tensor(w)) or w.ndim != 2 or (w.shape[1] % 4) != 0:
         return w
-    # Reshape to [out//4, 4, in] to group along output dimension
+    # Reshape to [out, in//4, 4] to group along input dimension
     out_dim, in_dim = w.shape
-    w4 = w.reshape(out_dim // 4, 4, in_dim)  # [out//4, 4, in]
-    # Find 2 smallest magnitudes along the group-of-4 dimension (dim=1)
-    _, idx = torch.topk(w4.abs(), k=2, dim=1, largest=False)  # [out//4, 2, in]
+    w4 = w.reshape(out_dim, in_dim // 4, 4)  # [out, in//4, 4]
+    # Find 2 smallest magnitudes along the group-of-4 dimension (dim=2)
+    _, idx = torch.topk(w4.abs(), k=2, dim=2, largest=False)  # [out, in//4, 2]
     w4p = w4.clone()
-    w4p.scatter_(1, idx, 0)
+    w4p.scatter_(2, idx, 0)
     return w4p.reshape_as(w)
 
 
 def fraction_groups_2to4(w: torch.Tensor) -> float:
-    """Fraction of 4-tuples having exactly 2 zeros along output dimension.
+    """Fraction of 4-tuples having exactly 2 zeros along input dimension.
     
-    For nn.Linear.weight [out, in], checks sparsity pattern along the output
+    For nn.Linear.weight [out, in], checks sparsity pattern along the in_features
     dimension to verify TensorRT 2:4 sparse tensor core compatibility.
     """
-    if (not torch.is_tensor(w)) or w.ndim != 2 or (w.shape[0] % 4) != 0:
+    if (not torch.is_tensor(w)) or w.ndim != 2 or (w.shape[1] % 4) != 0:
         return 0.0
     out_dim, in_dim = w.shape
-    w4 = w.reshape(out_dim // 4, 4, in_dim)  # [out//4, 4, in]
-    z = (w4 == 0).sum(dim=1)  # [out//4, in] - count zeros in each group of 4
+    w4 = w.reshape(out_dim, in_dim // 4, 4)  # [out, in//4, 4]
+    z = (w4 == 0).sum(dim=2)  # [out, in//4] - count zeros in each group of 4
     return float((z == 2).float().mean().item())
 
 
@@ -979,6 +1063,13 @@ def main():
     ap.add_argument("--vlm_autocast", action="store_true", help="Only meaningful when --vlm_precision policy")
     ap.add_argument("--quant_do_e2e", action="store_true", help="Also benchmark quant checkpoint end-to-end (runs VLM inside generate_actions). Default is transformer-only E2E = vlm_ms + policy_ms.")
 
+    # Semi-structured sparsity for pruned model
+    ap.add_argument(
+        "--pruned_semi_structured",
+        action="store_true",
+        help="Convert pruned model weights to semi-structured sparse format for hardware acceleration. "
+             "Requires PyTorch 2.1+ and Ampere+ GPU. The pruned model must have 2:4 sparsity pattern.",
+    )
 
     # TensorRT (transformer-only)
     ap.add_argument("--trt", action="store_true")
@@ -1024,13 +1115,43 @@ def main():
     r_base["ckpt"] = args.baseline_id
     out["baseline"] = r_base
 
-    # Pruned
-    pruned = load_model(args.pruned_ckpt, device=device, policy_dtype=policy_dtype, vlm_precision=args.vlm_precision, local_files_only=args.local_files_only)
-    patch_action_encoder_dtype(pruned)
-    patch_action_space_preprocess_safe(pruned)
-    r_pruned = bench_variant(pruned, batch, steps=args.steps, warmup=args.warmup, iters=args.iters, use_autocast=use_autocast, vlm_autocast=vlm_autocast)
-    r_pruned["ckpt"] = args.pruned_ckpt
-    out["pruned"] = r_pruned
+    # Pruned (dense - no semi-structured conversion)
+    # This shows the impact of sparsity pattern alone (zeros in weights)
+    pruned_dense = load_model(args.pruned_ckpt, device=device, policy_dtype=policy_dtype, vlm_precision=args.vlm_precision, local_files_only=args.local_files_only)
+    patch_action_encoder_dtype(pruned_dense)
+    patch_action_space_preprocess_safe(pruned_dense)
+    
+    r_pruned_dense = bench_variant(pruned_dense, batch, steps=args.steps, warmup=args.warmup, iters=args.iters, use_autocast=use_autocast, vlm_autocast=vlm_autocast)
+    r_pruned_dense["ckpt"] = args.pruned_ckpt
+    r_pruned_dense["semi_structured"] = False
+    out["pruned_dense"] = r_pruned_dense
+    
+    # Clean up to free memory before next model
+    del pruned_dense
+    torch.cuda.empty_cache()
+
+    # Pruned with semi-structured (if requested)
+    # NOTE: PyTorch's SparseSemiStructuredTensor is prototype and may have overhead
+    # that outweighs benefits for small batch sizes or certain tensor dimensions.
+    # Real speedup typically requires TensorRT export.
+    if args.pruned_semi_structured:
+        pruned_sparse = load_model(args.pruned_ckpt, device=device, policy_dtype=policy_dtype, vlm_precision=args.vlm_precision, local_files_only=args.local_files_only)
+        patch_action_encoder_dtype(pruned_sparse)
+        patch_action_space_preprocess_safe(pruned_sparse)
+        
+        sparse_stats = convert_to_semi_structured(pruned_sparse, scope="transformer")
+        print(f"[bench] Semi-structured conversion: {sparse_stats}")
+        
+        r_pruned_sparse = bench_variant(pruned_sparse, batch, steps=args.steps, warmup=args.warmup, iters=args.iters, use_autocast=use_autocast, vlm_autocast=vlm_autocast)
+        r_pruned_sparse["ckpt"] = args.pruned_ckpt
+        r_pruned_sparse["semi_structured"] = sparse_stats
+        out["pruned_semi_structured"] = r_pruned_sparse
+        
+        del pruned_sparse
+        torch.cuda.empty_cache()
+    
+    # Use pruned_dense for speedup comparison (it's the fair comparison)
+    r_pruned = r_pruned_dense
 
     # Quant (transformer-only state)
     quant = load_model(args.quant_ckpt, device=device, policy_dtype=policy_dtype, vlm_precision=args.vlm_precision, local_files_only=args.local_files_only)
@@ -1038,17 +1159,54 @@ def main():
     restore_transformer_modelopt_state(quant, q_state)
     patch_action_encoder_dtype(quant)
     patch_action_space_preprocess_safe(quant)
+    
+    # NOTE: Do NOT apply semi-structured conversion to quantized models!
+    # SparseSemiStructuredTensor doesn't support ModelOpt's FP8/INT8 quantization ops.
+    # The quantized model already has the sparsity pattern embedded - TensorRT or
+    # specialized kernels handle sparse+quant together differently.
+    
     r_quant = bench_variant(quant, batch, steps=args.steps, warmup=args.warmup, iters=args.iters, use_autocast=use_autocast, vlm_autocast=vlm_autocast, do_e2e=args.quant_do_e2e)
     r_quant["ckpt"] = args.quant_ckpt
     r_quant["state"] = str(q_state)
     out["quant_transformer_only"] = r_quant
 
-    out["speedup_vs_baseline"] = {
-        "pruned_e2e_x": float(r_base["e2e_ms"] / r_pruned["e2e_ms"]),
+    # Compute speedups
+    speedups = {
+        "pruned_dense_e2e_x": float(r_base["e2e_ms"] / r_pruned_dense["e2e_ms"]),
+        "pruned_dense_policy_x": float(r_base["policy_ms"] / r_pruned_dense["policy_ms"]),
         "quant_e2e_x": float(r_base["e2e_ms"] / r_quant["e2e_ms"]),
-        "pruned_policy_x": float(r_base["policy_ms"] / r_pruned["policy_ms"]),
         "quant_policy_x": float(r_base["policy_ms"] / r_quant["policy_ms"]),
     }
+    
+    if args.pruned_semi_structured and "pruned_semi_structured" in out:
+        r_sparse = out["pruned_semi_structured"]
+        speedups["pruned_sparse_e2e_x"] = float(r_base["e2e_ms"] / r_sparse["e2e_ms"])
+        speedups["pruned_sparse_policy_x"] = float(r_base["policy_ms"] / r_sparse["policy_ms"])
+        # Compare sparse vs dense
+        speedups["sparse_vs_dense_policy_x"] = float(r_pruned_dense["policy_ms"] / r_sparse["policy_ms"])
+    
+    out["speedup_vs_baseline"] = speedups
+    
+    # Print summary and recommendations
+    print("\n" + "="*60)
+    print("PYTORCH PERFORMANCE SUMMARY")
+    print("="*60)
+    print(f"Baseline policy:        {r_base['policy_ms']:.2f} ms")
+    print(f"Pruned (dense) policy:  {r_pruned_dense['policy_ms']:.2f} ms ({speedups['pruned_dense_policy_x']:.2f}x)")
+    if args.pruned_semi_structured and "pruned_semi_structured" in out:
+        r_sparse = out["pruned_semi_structured"]
+        print(f"Pruned (sparse) policy: {r_sparse['policy_ms']:.2f} ms ({speedups['pruned_sparse_policy_x']:.2f}x)")
+    print(f"Quantized policy:       {r_quant['policy_ms']:.2f} ms ({speedups['quant_policy_x']:.2f}x)")
+    print("="*60)
+    
+    if args.pruned_semi_structured and speedups.get("sparse_vs_dense_policy_x", 1.0) < 1.0:
+        print("\n⚠️  WARNING: Semi-structured sparsity is SLOWER than dense!")
+        print("   This is expected with PyTorch's prototype SparseSemiStructuredTensor.")
+        print("   For real speedup from 2:4 sparsity, use TensorRT export with --trt --trt_sparse")
+    
+    if args.trt:
+        print("\n[TRT] Building TensorRT engine... (results will be shown after build)")
+    print()
 
     # TensorRT path: build and benchmark transformer-only
     if args.trt:
@@ -1084,19 +1242,23 @@ def main():
             # This is the correct place for X-VLA because DomainAwareLinear gets frozen into nn.Linear here.
             if args.trt_prune_2to4:
                 pruned = 0
+                skipped = 0
                 checked = 0
                 for lname, lm in frozen_tf.named_modules():
                     if isinstance(lm, torch.nn.Linear) and getattr(lm, "weight", None) is not None:
                         w = lm.weight.data
+                        # 2:4 sparsity requires in_features divisible by 4
                         if w.ndim == 2 and (w.shape[1] % 4 == 0):
                             lm.weight.data.copy_(prune_2to4_lastdim(w))
                             pruned += 1
                             if args.trt_verbose and checked < 3:
                                 frac = fraction_groups_2to4(lm.weight.data)
-                                print(f"[trt] 2:4 check {lname}: {frac*100:.1f}% groups")
+                                print(f"[trt] 2:4 check {lname}: {frac*100:.1f}% groups have exactly 2 zeros")
                                 checked += 1
+                        else:
+                            skipped += 1
                 if args.trt_verbose:
-                    print(f"[trt] Applied 2:4 pruning to {pruned} nn.Linear layers in frozen_tf")
+                    print(f"[trt] Applied 2:4 pruning to {pruned} nn.Linear layers, skipped {skipped} incompatible layers")
 
             # Build export wrapper, domain_id becomes internal constant
             export_mod = TransformerTRTExport(frozen_tf, args_template=args_template, domain=int(args.trt_domain)).eval().cuda()
@@ -1144,12 +1306,36 @@ def main():
             out["trt_transformer_only"] = {
                 "domain": int(args.trt_domain),
                 "fp16": bool(args.trt_fp16),
+                "sparse": bool(args.trt_sparse),
+                "prune_2to4": bool(args.trt_prune_2to4),
                 "onnx": str(onnx_path),
                 "engine": str(engine_path),
                 "transformer_ms": float(trt_ms),
             }
+            
+            # Add TRT speedup to comparison
+            trt_policy_speedup = r_base["policy_ms"] / trt_ms
+            out["speedup_vs_baseline"]["trt_policy_x"] = float(trt_policy_speedup)
+            
+            # Estimate TRT E2E (VLM + TRT transformer)
+            trt_e2e_ms = r_base["vlm_ms"] + trt_ms
+            out["trt_transformer_only"]["e2e_estimated_ms"] = float(trt_e2e_ms)
+            out["speedup_vs_baseline"]["trt_e2e_estimated_x"] = float(r_base["e2e_ms"] / trt_e2e_ms)
+            
+            # Print TRT results
+            print("\n" + "="*60)
+            print("TENSORRT RESULTS")
+            print("="*60)
+            print(f"TRT Transformer:        {trt_ms:.2f} ms ({trt_policy_speedup:.2f}x vs baseline policy)")
+            print(f"TRT E2E (estimated):    {trt_e2e_ms:.2f} ms ({r_base['e2e_ms'] / trt_e2e_ms:.2f}x vs baseline E2E)")
+            print(f"  (VLM: {r_base['vlm_ms']:.2f} ms + TRT: {trt_ms:.2f} ms)")
+            print("="*60)
+            print()
+            
         except Exception as e:
             out["trt_transformer_only_error"] = str(e)
+            import traceback
+            traceback.print_exc()
 
     print(json.dumps(out, indent=2), flush=True)
 

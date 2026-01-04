@@ -218,24 +218,27 @@ except ImportError:
 
 
 def prune_2to4_lastdim(w: torch.Tensor) -> torch.Tensor:
-    """Apply 2:4 structured sparsity along the output (first) dimension.
+    """Apply 2:4 structured sparsity along the input (last/K) dimension.
     
     For nn.Linear.weight with shape [out_features, in_features], TensorRT's
-    sparse tensor cores expect 2:4 sparsity along the M (output) dimension.
-    We group every 4 output channels and zero the 2 smallest magnitudes.
+    sparse tensor cores expect 2:4 sparsity along the K (in_features) dimension.
+    PyTorch's semi-structured sparsity also requires this pattern.
+    
+    We group every 4 input features and zero the 2 smallest magnitudes.
     """
     if w.numel() == 0:
         return w
-    if w.ndim != 2 or (w.shape[0] % 4) != 0:
-        raise ValueError("weight must be 2D with first dim divisible by 4")
+    if w.ndim != 2 or (w.shape[1] % 4) != 0:
+        raise ValueError("weight must be 2D with in_features (last dim) divisible by 4")
 
     out_dim, in_dim = w.shape
-    w4 = w.reshape(out_dim // 4, 4, in_dim)  # [out//4, 4, in]
+    # Reshape to [out, in//4, 4] to group along input dimension
+    w4 = w.reshape(out_dim, in_dim // 4, 4)  # [out, in//4, 4]
 
-    # zero 2 smallest magnitude in each group of 4 along dim=1
-    idx = torch.argsort(w4.abs(), dim=1)[..., :2, :]  # [out//4, 2, in]
+    # Zero 2 smallest magnitude in each group of 4 along dim=2 (the groups of 4)
+    idx = torch.argsort(w4.abs(), dim=2)[..., :2]  # [out, in//4, 2]
     mask = torch.ones_like(w4, dtype=torch.bool)
-    mask.scatter_(dim=1, index=idx, value=False)
+    mask.scatter_(dim=2, index=idx, value=False)
     pruned = torch.where(mask, w4, torch.zeros_like(w4))
     return pruned.reshape_as(w)
 
@@ -264,6 +267,7 @@ def apply_2to4_pruning(
     model: nn.Module,
     scope: str,
     use_semi_structured: bool = False,
+    semi_structured_dtype: Optional[torch.dtype] = None,
 ) -> Dict[str, float]:
     """Apply 2:4 structured pruning to model weights.
     
@@ -273,6 +277,9 @@ def apply_2to4_pruning(
         use_semi_structured: If True, convert pruned weights to PyTorch's
             sparse semi-structured format for memory savings and faster inference.
             Requires PyTorch 2.1+ and Ampere+ GPU.
+        semi_structured_dtype: Target dtype for semi-structured conversion.
+            Must be float16 or bfloat16 (required by cuSPARSELt).
+            If None, will use the model's dtype or fall back to bfloat16.
     
     Returns:
         Dict with pruning statistics
@@ -286,6 +293,9 @@ def apply_2to4_pruning(
             "Requires PyTorch 2.1+ with CUDA support."
         )
 
+    # Semi-structured sparsity only supports fp16/bf16
+    SUPPORTED_SEMI_DTYPES = (torch.float16, torch.bfloat16)
+
     roots: List[nn.Module]
     if scope == "transformer":
         if not hasattr(model, "transformer"):
@@ -298,26 +308,43 @@ def apply_2to4_pruning(
     skipped_layers = 0
     semi_structured_layers = 0
     semi_structured_failures = 0
+    dtype_converted_layers = 0
 
     for root in roots:
         for name, m in root.named_modules():
             if isinstance(m, nn.Linear) and isinstance(m.weight, torch.Tensor):
+                # Check if in_features (weight.shape[1]) is divisible by 4
+                if m.weight.ndim != 2 or (m.weight.shape[1] % 4) != 0:
+                    skipped_layers += 1
+                    continue
                 try:
-                    # First apply 2:4 pruning pattern
+                    # First apply 2:4 pruning pattern along in_features dimension
                     pruned_weight = prune_2to4_lastdim(m.weight.data)
                     
                     if use_semi_structured:
                         # Try to convert to semi-structured sparse format
-                        # This requires specific shape constraints
+                        # This requires specific shape constraints AND fp16/bf16 dtype
                         try:
-                            # Semi-structured requires contiguous memory
+                            # Semi-structured requires contiguous memory and fp16/bf16
                             pruned_weight = pruned_weight.contiguous()
+                            
+                            # Convert dtype if needed (cuSPARSELt only supports fp16/bf16)
+                            if pruned_weight.dtype not in SUPPORTED_SEMI_DTYPES:
+                                target_dtype = semi_structured_dtype
+                                if target_dtype is None:
+                                    # Default to bf16 as it has better numerical range
+                                    target_dtype = torch.bfloat16
+                                if target_dtype not in SUPPORTED_SEMI_DTYPES:
+                                    target_dtype = torch.bfloat16
+                                pruned_weight = pruned_weight.to(dtype=target_dtype)
+                                dtype_converted_layers += 1
+                            
                             sparse_weight = convert_to_semi_structured(pruned_weight)
                             m.weight = nn.Parameter(sparse_weight, requires_grad=False)
                             semi_structured_layers += 1
                         except Exception as e:
                             # Fallback to dense storage if conversion fails
-                            # (e.g., incompatible shapes, CPU tensor, etc.)
+                            # (e.g., incompatible shapes, GPU not supported, etc.)
                             m.weight.data = pruned_weight
                             semi_structured_failures += 1
                             warnings.warn(
@@ -356,47 +383,98 @@ def apply_2to4_pruning(
         "skipped_layers": float(skipped_layers),
         "semi_structured_layers": float(semi_structured_layers),
         "semi_structured_failures": float(semi_structured_failures),
+        "dtype_converted_layers": float(dtype_converted_layers),
         "use_semi_structured": use_semi_structured,
     }
 
 
 # -----------------------------
-# Critical patch: cast transformer side inputs to match proj layer dtype
+# Critical patches for dtype mismatches
 # -----------------------------
 
-def patch_transformer_input_cast(xvla_model: nn.Module) -> None:
+def _first_tensor_dtype(mod: nn.Module) -> Optional[torch.dtype]:
+    """Get the dtype of the first parameter/buffer in a module."""
+    for p in mod.parameters(recurse=False):
+        return p.dtype
+    for _, b in mod.named_buffers(recurse=False):
+        if torch.is_tensor(b):
+            return b.dtype
+    for p in mod.parameters():
+        return p.dtype
+    for _, b in mod.named_buffers():
+        if torch.is_tensor(b):
+            return b.dtype
+    return None
+
+
+def patch_action_encoder_dtype(model: nn.Module) -> None:
     """
-    Fixes:
-      RuntimeError: mat1 and mat2 must have the same dtype, but got Float and BFloat16
-    by casting vlm_features and aux_visual_inputs to match the proj layers.
+    X-VLA action_encoder uses a custom matmul path:
+      y = matmul(x, W) + b
+    If x and W have different dtypes you get:
+      expected scalar type BFloat16 but found Float
+    Patch forward to cast x to encoder internal dtype.
+    """
+    if not (hasattr(model, "transformer") and hasattr(model.transformer, "action_encoder")):
+        return
+
+    enc = model.transformer.action_encoder
+    
+    # Prevent double-patching
+    if getattr(enc, "_dtype_patched", False):
+        return
+    enc._dtype_patched = True
+    
+    orig_forward = enc.forward
+
+    def wrapped_forward(x: torch.Tensor, *args, **kwargs):
+        target = _first_tensor_dtype(enc)
+        if target is not None and torch.is_tensor(x) and x.dtype != target:
+            x = x.to(dtype=target)
+        return orig_forward(x, *args, **kwargs)
+
+    enc.forward = wrapped_forward
+
+
+def patch_transformer_input_cast(xvla_model: nn.Module, target_dtype: Optional[torch.dtype] = None) -> None:
+    """
+    Register forward pre-hooks on vlm_proj and aux_visual_proj to cast inputs to the target dtype.
+    This handles the case where VLM features are computed in fp32 but transformer weights are in fp16/bf16.
+    Uses hooks instead of monkey-patching to be robust to module replacement by ModelOpt.
     """
     if not hasattr(xvla_model, "transformer"):
         return
 
     tr = xvla_model.transformer
-    if not hasattr(tr, "forward"):
-        return
-
-    orig_forward = tr.forward
-
-    def _dtype_of(mod: nn.Module, fallback: torch.dtype) -> torch.dtype:
-        for p in mod.parameters(recurse=False):
-            return p.dtype
-        return fallback
-
-    def wrapped_forward(*args, **kwargs):
-        # Try kwargs first (most stable)
-        if "vlm_features" in kwargs and torch.is_tensor(kwargs["vlm_features"]) and hasattr(tr, "vlm_proj"):
-            tgt = _dtype_of(tr.vlm_proj, kwargs["vlm_features"].dtype)
-            kwargs["vlm_features"] = kwargs["vlm_features"].to(dtype=tgt)
-
-        if "aux_visual_inputs" in kwargs and torch.is_tensor(kwargs["aux_visual_inputs"]) and hasattr(tr, "aux_visual_proj"):
-            tgt = _dtype_of(tr.aux_visual_proj, kwargs["aux_visual_inputs"].dtype)
-            kwargs["aux_visual_inputs"] = kwargs["aux_visual_inputs"].to(dtype=tgt)
-
-        return orig_forward(*args, **kwargs)
-
-    tr.forward = wrapped_forward
+    
+    # Determine target dtype
+    if target_dtype is None:
+        target_dtype = torch.bfloat16
+    
+    def make_pre_hook(dtype):
+        def pre_hook(module, args):
+            # args is a tuple of inputs
+            if len(args) > 0:
+                inp = args[0]
+                if torch.is_tensor(inp) and inp.is_floating_point() and inp.dtype != dtype:
+                    return (inp.to(dtype=dtype),) + args[1:]
+            return args
+        return pre_hook
+    
+    # Register hooks on specific projection layers
+    for proj_name in ("vlm_proj", "aux_visual_proj"):
+        if not hasattr(tr, proj_name):
+            continue
+        
+        proj = getattr(tr, proj_name)
+        
+        # Remove existing hooks if any (to prevent duplication)
+        if hasattr(proj, "_dtype_cast_hook_handle"):
+            proj._dtype_cast_hook_handle.remove()
+        
+        # Register new pre-hook
+        handle = proj.register_forward_pre_hook(make_pre_hook(target_dtype))
+        proj._dtype_cast_hook_handle = handle
 
 
 # -----------------------------
@@ -425,8 +503,33 @@ def hf_save_checkpoint(model: nn.Module, tokenizer: Optional[object], export_dir
     """
     Save a plain HF checkpoint (no ModelOpt plugin required).
     This is called BEFORE we import modelopt.torch.opt, to avoid any global monkey patches.
+    
+    Note: Semi-structured sparse tensors must be converted to dense before saving,
+    as safetensors cannot handle the compressed sparse storage format.
     """
     export_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Convert any semi-structured sparse tensors to dense before saving
+    # (safetensors cannot serialize SparseSemiStructuredTensor)
+    sparse_converted = []
+    for name, param in model.named_parameters():
+        if hasattr(param, 'to_dense') and hasattr(param, 'compressed_swizzled_bitmask'):
+            # This is a SparseSemiStructuredTensor - convert to dense
+            dense_data = param.to_dense()
+            # We need to find the module and replace the parameter
+            parts = name.rsplit('.', 1)
+            if len(parts) == 2:
+                parent_name, param_name = parts
+                parent = model.get_submodule(parent_name)
+            else:
+                parent = model
+                param_name = name
+            setattr(parent, param_name, nn.Parameter(dense_data, requires_grad=False))
+            sparse_converted.append(name)
+    
+    if sparse_converted:
+        print(f"[save] Converted {len(sparse_converted)} semi-structured sparse tensors to dense for serialization")
+    
     model.save_pretrained(str(export_dir), safe_serialization=True)
     if tokenizer is not None:
         try:
@@ -462,6 +565,7 @@ def modelopt_ptq_transformer_only(
     quant: str,
     denoise_steps: int,
     use_autocast: bool,
+    target_dtype: torch.dtype = torch.bfloat16,
 ) -> object:
     """
     Quantize ONLY model.transformer. Returns the transformer-only ModelOpt state object.
@@ -474,29 +578,52 @@ def modelopt_ptq_transformer_only(
 
     cfg = get_modelopt_cfg(quant)
     device = next(model.parameters()).device
-    tr_dtype = next(model.transformer.parameters()).dtype
+    tr_dtype = target_dtype  # Use explicit dtype instead of detecting
 
-    # Make sure transformer will not choke on fp32 vlm features
-    patch_transformer_input_cast(model)
+    patch_action_encoder_dtype(model)
 
     def forward_loop(_ignored_module: nn.Module):
+        # Apply input cast patch inside forward_loop
+        # This ensures it's applied AFTER mtq.quantize modifies the module
+        patch_transformer_input_cast(model, target_dtype=tr_dtype)
+        
         for p in calib_files:
             batch = load_npz_batch(p, device=device, dtype=tr_dtype)
             batch = sanitize_xvla_batch(model, batch)
 
-            # Compute VLM features once in fp32
-            enc = model.forward_vlm(batch["input_ids"], batch["image_input"], batch["image_mask"])
-            if torch.is_tensor(enc):
-                enc = enc.detach()
+            # Run VLM once to get features, but keep them in the stub
+            # We'll use autocast to handle the VLM in fp32 internally
+            with torch.no_grad():
+                # VLM expects fp32 image_input, compute features
+                enc = model.forward_vlm(batch["input_ids"], batch["image_input"], batch["image_mask"])
+            
+            # Cast VLM output to target dtype and clone to avoid any aliasing issues
+            if isinstance(enc, dict):
+                enc_casted = {}
+                for k, v in enc.items():
+                    if torch.is_tensor(v) and v.is_floating_point():
+                        enc_casted[k] = v.detach().clone().to(dtype=tr_dtype)
+                    else:
+                        enc_casted[k] = v
+                enc = enc_casted
+            elif torch.is_tensor(enc):
+                enc = enc.detach().clone().to(dtype=tr_dtype)
 
-            # Stub forward_vlm so generate_actions does not re-run Florence2 during calibration
+            # Stub forward_vlm to bypass VLM and return pre-computed bf16 features
             orig_forward_vlm = model.forward_vlm
-            model.forward_vlm = lambda *args, **kwargs: enc
+            
+            # Create stub as a class to avoid closure issues
+            class VLMStub:
+                def __init__(self, cached_enc):
+                    self.cached_enc = cached_enc
+                def __call__(self, *args, **kwargs):
+                    return self.cached_enc
+            
+            model.forward_vlm = VLMStub(enc)
+            
             try:
-                if use_autocast and device.type == "cuda":
-                    with torch.autocast(device_type="cuda", dtype=tr_dtype):
-                        _ = model.generate_actions(**batch, steps=denoise_steps)
-                else:
+                # Always use autocast for the transformer part
+                with torch.autocast(device_type="cuda", dtype=tr_dtype, enabled=True):
                     _ = model.generate_actions(**batch, steps=denoise_steps)
             finally:
                 model.forward_vlm = orig_forward_vlm
@@ -518,6 +645,7 @@ def modelopt_ptq_full_model(
     quant: str,
     denoise_steps: int,
     use_autocast: bool,
+    target_dtype: torch.dtype = torch.bfloat16,
 ) -> object:
     """
     Quantize the full model. This is only needed if you want to use ModelOpt HF plugin export.
@@ -526,9 +654,10 @@ def modelopt_ptq_full_model(
 
     cfg = get_modelopt_cfg(quant)
     device = next(model.parameters()).device
-    model_dtype = next(model.parameters()).dtype
+    model_dtype = target_dtype  # Use explicit dtype
 
-    patch_transformer_input_cast(model)
+    patch_transformer_input_cast(model, target_dtype=target_dtype)
+    patch_action_encoder_dtype(model)
 
     def forward_loop(_ignored_module: nn.Module):
         for p in calib_files:
@@ -620,7 +749,9 @@ def main() -> None:
         except Exception:
             pass
 
-    patch_transformer_input_cast(model)
+    # Apply dtype patches with explicit target dtype
+    patch_transformer_input_cast(model, target_dtype=torch_dtype)
+    patch_action_encoder_dtype(model)
 
     report: Dict[str, object] = {
         "model_id": args.model_id,
@@ -648,6 +779,7 @@ def main() -> None:
             model,
             scope=args.prune_scope,
             use_semi_structured=args.prune_semi_structured,
+            semi_structured_dtype=torch_dtype,  # Use the model's target dtype (bf16/fp16)
         )
         report["did_prune"] = True
         report["prune_scope"] = args.prune_scope
@@ -677,6 +809,7 @@ def main() -> None:
                 quant=args.quant,
                 denoise_steps=args.denoise_steps,
                 use_autocast=bool(args.use_autocast),
+                target_dtype=torch_dtype,
             )
 
             # Save transformer-only state
@@ -693,6 +826,7 @@ def main() -> None:
                 quant=args.quant,
                 denoise_steps=args.denoise_steps,
                 use_autocast=bool(args.use_autocast),
+                target_dtype=torch_dtype,
             )
 
             if args.export_mode == "modelopt_plugin":
