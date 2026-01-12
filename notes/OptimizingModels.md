@@ -1,363 +1,457 @@
 # Optimizing Models: A Train Of Thought
 
-**An T. Le, Hanoi, Nov 2025**
+**An T. Le, Hanoi, Nov 2025 (revised Jan 2026)**
 
-In practice, modern foundation models are optimized in two layers:
+In practice, modern foundation models are optimized in two tightly-coupled layers:
 
-- (A) Model-level optimization: techniques such as quantization, pruning and sparsity, knowledge distillation, and low-rank / factorized parameterization that reduce compute and memory while preserving task performance.
-- (B) Edge-level deployment optimization: toolchains and runtimes (e.g., TensorRT / ModelOpt, Intel Neural Compressor + OpenVINO, TorchAO, ONNX Runtime, TFLite, TVM, ncnn, etc.) that take an optimized model and generate hardware-specific inference engines for GPUs, CPUs, and embedded/edge SoCs.
+- **(A) Model-side optimization:** quantization, pruning/sparsity, distillation, low-rank / factorized parameterization, etc. (reduce compute/memory while preserving task performance).
+- **(B) Deployment optimization:** compilers + runtimes (e.g., **TensorRT-LLM/TensorRT**, **OpenVINO**, **ONNX Runtime**, **LiteRT** (ex-TFLite), **TVM**, **ncnn**, vendor SDKs) that turn an optimized checkpoint into a hardware-efficient engine.
 
-Let's dive into mainstream pathways that smashes foundation models then optimizes for deployments on SoCs.
+> NOTE: TorchAO / **torchao** mostly belongs to (A), but it increasingly acts as the “bridge” into (B) via export/compile flows.
+
+This note is a quick mental map of the mainstream pathways for compressing and deploying foundation models (with links to docs + code).
 
 ---
 
-## 1. Mainstream **(A) Model-level optimization**
+## 1. Mainstream **(A) Model-side optimization**
 
 ### 1.1 Quantization (almost always the first step)
 
-Goal: reduce weights/activations from FP16/FP32 -> INT8/INT4/FP8/NVFP4 while keeping accuracy.
+**Goal:** reduce weights/activations from FP16/FP32 -> INT8/INT4/FP8/FP4 **without** unacceptable accuracy loss.
 
-Common variants (esp. for big transformers & FMs) ([see Model Opt Survey][1]):
+Common variants (esp. for transformers) (survey: [Zhu et al., 2024][survey-llm-compression]):
 
-* **Post-Training Quantization (PTQ)**
+- **Post-Training Quantization (PTQ)**  
+  No retraining; use a small calibration set.
+  - *Static* (typical INT8): collect activation stats offline, quantize weights + activations.
+  - *Dynamic* (common on CPUs): quantize weights offline; compute some activation quant params at runtime.
+  - Transformer-specific PTQ recipes (examples): **SmoothQuant**, **AWQ**.
 
-  * No retraining; use a small calibration set.
-  * Static vs dynamic:
+  Codebases:
+  - SmoothQuant: [mit-han-lab/smoothquant][smoothquant]
+  - AWQ: [mit-han-lab/llm-awq][awq]
 
-    * *Static:* collect activation stats on a calibration set, quantize both weights + activations (INT8 is standard).
-    * *Dynamic:* quantize weights offline, activations quantized on-the-fly (common for CPUs).
-  * Foundation-model-specific flavors:
+- **Quantization-Aware Training (QAT)**  
+  Simulate quantization during fine-tuning to recover accuracy when PTQ is too lossy.
+  - PyTorch-native QAT for low-bit: [torchao QAT docs][torchao-qat]
+  - NVIDIA QAT workflows (for TensorRT/TensorRT-LLM): [Model Optimizer docs][modelopt-docs]
 
-    * **SmoothQuant**, **AWQ (Activation-aware Weight Quantization)**, “AutoQuantize” for robust 8/4-bit on transformers. ([see Edge AI and Vision Alliance][2])
-    * KV-cache-only quantization (4–8 bit) to shrink memory and speed long context inference.
+- **Mixed precision & vendor-specific formats**
+  - Mixed FP16/BF16 is the default “cheap win.”
+  - NVIDIA-specific low-bit floats: **FP8** and **NVFP4/FP4** are supported through **TensorRT** + **NVIDIA Model Optimizer (ModelOpt)**.  
+    Practical entry points: [NVFP4 overview][nvfp4-blog], [TensorRT quantized types][tensorrt-quantized-types].
 
-* **Quantization-Aware Training (QAT)**
+> Reality check: the *format* only matters if your deployment stack has the matching kernels (this is where TensorRT-LLM / TensorRT / OpenVINO / ORT / LiteRT differ).
 
-  * Simulate quantization during finetuning; highest accuracy, but needs training loop.
-  * Used when you need INT8/INT4 on tough tasks (manipulation, safety-critical robotics) and PTQ alone is too lossy. ([QAT][3])
+**Example (GR00T-style VLA):**
+- Vision + language backbones: INT8 / FP8 / FP4 (where supported)
+- Action/diffusion head + final layers: FP16/BF16
 
-* **Mixed precision & custom formats**
-
-  * FP16 / BF16 for most layers, FP32 on layernorms / critical parts.
-  * NVIDIA-specific: **FP8** and **NVFP4** (4-bit) formats, integrated in TensorRT-LLM / ModelOpt optimized checkpoints. ([see Edge AI and Vision Alliance][2])
-
-**Example:** for GR00T, a very typical recipe is:
-
-* Vision + language backbones: 8-bit (or FP8/NVFP4)
-* Action/diffusion head + final layers: stay FP16 or BF16
+References:
+- GR00T N1.5 technical page: [research.nvidia.com/labs/gear/gr00t-n1_5][groot-n15]
+- Isaac GR00T code/checkpoints: [NVIDIA/Isaac-GR00T][isaac-groot]
 
 ---
 
 ### 1.2 Pruning & sparsity
 
-Goal: remove “unimportant” parameters, often combined with quant.
+**Goal:** remove “unimportant” parameters (often combined with quantization). Speedups depend heavily on **kernel support** and **sparsity structure**.
 
-Main flavors for large transformers & FMs ([see docs][4]):
+Common flavors:
 
-* **Unstructured pruning (weight sparsity)**
+- **Unstructured pruning (weight sparsity)**
+  - Easy to apply, but usually needs specialized sparse kernels to see wall-clock speedups.
 
-  * Magnitude pruning: drop smallest-magnitude weights.
-  * Activation-based pruning: use calibration activations to decide importance.
-  * Easy to apply, but needs sparse-aware kernels to really speed up.
+- **Structured pruning (more reliable speedups)**
+  - Prune attention heads, MLP channels, entire blocks/layers, tokens, etc.
 
-* **Structured pruning (real-world speedups)**
+- **N:M (semi-structured) sparsity**
+  - Example: **2:4 sparsity** (50% zeros in a constrained pattern) which maps to NVIDIA Sparse Tensor Cores.
+  - Acceleration stack often involves **TensorRT** and/or **cuSPARSELt** plus an export path that preserves sparsity metadata.
 
-  * Prune **attention heads**, **MLP channels**, **entire blocks/layers**, or **tokens**.
-  * For transformers: common to prune least-useful heads, shrink FFN hidden dims, or drop shallow/deep blocks.
-
-* **N:M sparsity / semi-structured sparsity**
-
-  * E.g. 2:4 sparsity (2 non-zeros per 4 weights) that matches hardware support on NVIDIA GPUs.
-  * Supported in some vendor libraries (TensorRT, cuSparse, TorchAO) to get actual speedups. ([GitHub][5])
-
-**Example:** for GR00T, a very typical recipe is:
-
-* Prune *select layers/heads* in the language backbone and MLPs,
-* Maybe leave vision encoder and action head less pruned because they’re already critical & smaller.
+  References:
+  - cuSPARSELt docs: [docs.nvidia.com/cuda/cusparselt][cusparselt]
+  - torchao sparsity overview (incl. semi-structured): [torchao sparsity docs][torchao-sparsity]
+  - NVIDIA Model Optimizer (pruning + sparsity): [Model Optimizer repo][modelopt-repo]
 
 ---
 
 ### 1.3 Knowledge Distillation (KD)
 
-Goal: train a smaller/cheaper “student” to mimic a large “teacher”. ([see PyTorch documentation][6])
+**Goal:** train a smaller/cheaper **student** to mimic a larger **teacher**.
 
 Main flavors:
+- **Logit distillation:** student matches teacher soft logits.
+- **Feature distillation:** align hidden states / attention maps.
+- **Sequence / behavior distillation:** student imitates teacher-generated trajectories/actions.
 
-* **Logit distillation:** student matches teacher’s soft logits (standard Hinton KD).
-* **Feature distillation:** align hidden states / attention maps; popular for transformers.
-* **Sequence / behavior-level distillation:** student imitates teacher’s generated trajectories / actions.
-
-**Example**: for robotics FMs:
-
-* **Policy distillation:** teacher GR00T-like model generates actions, student learns a simpler policy (smaller transformer or MLP head).
-* **Task-specific students:** e.g., a small arm-only policy distilled from a huge general VLA, or a lower-frequency high-level planner distilled into a compact controller.
-
-KD is often combined with pruning/quant:
-
-> prune -> finetune with distillation -> quantize -> (optional) KD again to recover accuracy.
+Tutorials / tooling:
+- PyTorch KD tutorial: [Knowledge distillation in PyTorch][pytorch-kd]
+- NVIDIA distillation workflow (ModelOpt + NeMo/HF): [Model Optimizer distillation docs][modelopt-distill]
 
 ---
 
 ### 1.4 Low-rank & factorization tricks
 
-Often grouped with compression even if they’re also “adaptation” methods ([see Model Optimization Survey][1]):
+Often used for *parameter-efficient adaptation*, and sometimes for compression if merged or baked into the final model:
 
-* **LoRA / low-rank adapters:** represent deltas in low rank; you can freeze the base and only train low-rank matrices, then optionally *merge* or keep them separate.
-* **Tensor decompositions:** factor big weight matrices (e.g., SVD, Tucker, CP) to smaller components.
-* **Block sharing / parameter tying:** reuse blocks across layers.
+- **LoRA / low-rank adapters:** train low-rank deltas, optionally merge.
+  - LoRA ref: [microsoft/LoRA][lora]
+  - Practical LoRA/QLoRA tooling: [huggingface/peft][peft]
 
-These are widely used to *reduce trainable parameters* and sometimes inference cost, especially if merged back into a smaller dense matrix.
-
----
-
-## 2. Mainstream **(B) Edge-level pipelines / toolchains**
-
-### 2.1 NVIDIA-centric: TensorRT-LLM + TensorRT Model Optimizer
-
-This toolchain is popular recently (2024–2025), especially for large transformers and FMs. For GR00T-style models on NVIDIA GPUs, this is the canonical stack.
-
-* **TensorRT Model Optimizer (ModelOpt)**: library of SOTA optimization techniques:
-  quantization, distillation, pruning, speculative decoding, sparsity, etc. ([GitHub][5])
-* **Pipeline sketch:**
-
-  1. Start from PyTorch / HuggingFace checkpoint (e.g., GR00T N1.5).
-  2. Export to ONNX or use TensorRT-LLM’s direct integration.
-  3. Run **PTQ or QAT** with ModelOpt (INT8 / FP8 / NVFP4), optionally with AWQ/SmoothQuant-style calibration.
-  4. Apply **pruning** (magnitude/activation, structured heads/MLP) if needed.
-  5. Optionally run **distillation** (ModelOpt has KD utilities for LLMs) to recover accuracy in a smaller student.
-  6. Build a **TensorRT engine** and deploy (Jetson, DGX, Thor, etc).
-
-NVIDIA is already shipping *pre-quantized, ModelOpt-optimized* checkpoints for many LLMs and generative models, and similar recipes are intended for GR00T-class models. ([see Nvidia docs][7])
+- **Matrix/tensor decompositions:** SVD / Tucker / CP, etc.
 
 ---
 
-### 2.2 Intel / CPU-oriented: Intel Neural Compressor + OpenVINO
+## 2. Mainstream **(B) Deployment pipelines / toolchains**
 
-If you care about x86 / CPU inference (servers, industrial PCs), the mainstream is:
+### 2.1 NVIDIA-centric: TensorRT-LLM + NVIDIA Model Optimizer (ModelOpt)
 
-* **Intel Neural Compressor (INC)**: one library that does **quantization, pruning, distillation, and even NAS**, across PyTorch / TF / ONNX. ([INC][8])
-* Typical pipeline:
+**NVIDIA Model Optimizer** (formerly “TensorRT Model Optimizer”) is the main toolkit for PTQ/QAT + pruning + distillation + speculative decoding + sparsity in the NVIDIA stack.
 
-  1. Start with PyTorch model.
-  2. Wrap it in INC’s **INCQuantizer**.
-  3. Let INC search over quantization/pruning configs with accuracy constraints.
-  4. Optionally enable KD from a larger teacher.
-  5. Export to **OpenVINO IR** for deployment.
+- Code + docs:
+  - Repo: [NVIDIA/Model-Optimizer][modelopt-repo]
+  - Docs: [nvidia.github.io/Model-Optimizer][modelopt-docs]
+- LLM runtime:
+  - TensorRT-LLM repo: [NVIDIA/TensorRT-LLM][tensorrt-llm-repo]
+  - TensorRT-LLM docs: [nvidia.github.io/TensorRT-LLM][tensorrt-llm-docs]
 
-There are HF tutorials doing exactly this for transformer models (DistilBERT etc.). ([see this][9])
+**Pipeline sketch**
+1. Start from a Hugging Face / PyTorch checkpoint (e.g., GR00T N1.5).
+2. Apply PTQ or QAT with ModelOpt (INT8/FP8/NVFP4, etc.).
+3. If needed: pruning/sparsity + distillation to recover accuracy at lower cost.
+4. Export/build a TensorRT(-LLM) engine; deploy (Jetson / server GPUs / Blackwell-class hardware).
+
+Pre-quantized checkpoints:
+- Hugging Face collection: [Inference-optimized checkpoints (Model Optimizer)][modelopt-hf-collection]
 
 ---
 
-### 2.3 PyTorch-native: TorchAO + built-in PyTorch APIs
+### 2.2 Intel / CPU-centric: OpenVINO + NNCF (plus Intel Neural Compressor where useful)
 
-For research & quick iteration where you want to stay in pure PyTorch:
+For Intel CPUs/GPUs and many industrial deployments, the “mainline” path today is:
 
-* **TorchAO (Training-to-Serving Model Optimization)**
-  A PyTorch-native framework that unifies **quantization + sparsity** across training and serving, aimed at large models. ([see paper][10])
+- **OpenVINO** as the inference runtime: [OpenVINO toolkit][openvino]
+- **NNCF** as the compression backend (PTQ/QAT/weight compression):  
+  - Docs: [OpenVINO model optimization (NNCF)][openvino-modelopt]
+  - Repo: [openvinotoolkit/nncf][nncf-repo]
 
-* Plus standard PyTorch utilities:
+Hugging Face-friendly workflow:
+- Optimum Intel + OpenVINO/NNCF: [Optimum Intel OpenVINO optimization][optimum-intel-openvino]
 
-  * `torch.quantization` / `torch.ao.quantization` for PTQ + QAT. ([see PyTorch docs][11])
-  * `torch.nn.utils.prune` for various pruning schemes. ([see PyTorch docs][12])
-  * KD implemented manually or via common recipes (e.g., aligning logits/hidden states). ([see PyTorch docs][6])
+**Intel Neural Compressor (INC)** is still relevant as a cross-framework quant/prune/distill toolkit (especially outside OpenVINO-only workflows):
+- Docs: [intel.github.io/neural-compressor][inc-docs]
+- Repo: [intel/neural-compressor][inc-repo]
 
-Typical flow:
+---
 
-1. Prototype pruning/quant (TorchAO / PyTorch).
-2. Train / distill student.
-3. Optionally export to ONNX and then to a deployment runtime (TensorRT, ONNX Runtime, TVM, etc.).
+### 2.3 PyTorch-native: torchao + torch.export (PT2E quantization)
+
+If you want to stay close to PyTorch while exploring low-bit + sparsity:
+
+- torchao docs: [pytorch.org/ao][torchao-docs]
+- Repo: [pytorch/ao][torchao-repo]
+
+Key tutorials (PyTorch 2 export quantization):
+- PTQ (graph-mode): [PyTorch 2 Export PTQ][pt2e-ptq]
+- QAT (graph-mode): [PyTorch 2 Export QAT][pt2e-qat]
+
+Pruning in “vanilla PyTorch”:
+- `torch.nn.utils.prune` is useful for simple experiments, but for structured pruning (channels/blocks with dependency handling), libraries like [VainF/Torch-Pruning][torch-pruning] are often more practical.
 
 ---
 
 ### 2.4 Framework-agnostic / edge-oriented runtimes
 
-For ARM SoCs, MCUs, or heterogeneous edge boxes (i.MX, AM69, Jetson Nano/Orin, etc.), mainstream choices are:
+Common choices across heterogeneous edge targets:
 
-* **ONNX Runtime** with built-in PTQ + graph optimizations (fusion, constant folding, etc.). ([see this][13])
-* **TensorFlow Lite** (especially mobile).
-* **TVM / Apache TVM**: auto-tuned kernels, supports quantization and some pruning-aware compilation.
-* **ncnn**: lightweight C++ runtime with its own quantization and graph optimizations (popular on mobile / embedded).
+- **ONNX Runtime** (quantization + graph optimizations):  
+  - ORT quantization docs: [onnxruntime.ai quantization guide][ort-quant]
+- **LiteRT** (formerly TensorFlow Lite) for mobile/embedded:  
+  - Overview: [ai.google.dev/edge/litert][litert]
+  - GitHub: [google-ai-edge/LiteRT][litert-repo]
+- **Apache TVM** (compiler + autotuning): [tvm.apache.org][tvm]
+- **ncnn** (lightweight C++ runtime): [Tencent/ncnn][ncnn]
 
-These generally expect:
-
-1. You do pruning/KD in PyTorch/TF.
-2. Export ONNX / TFLite.
-3. Run their **quantization + graph optimization** passes.
-4. Deploy as a small runtime binary.
+Typical flow:
+1. Do pruning/KD in PyTorch/TF.
+2. Export (ONNX / LiteRT / IR).
+3. Run runtime-specific quantization + graph optimizations.
+4. Deploy.
 
 ---
 
 ### 2.5 “All-in-one” compression frameworks
 
-Besides vendor stacks, a few general frameworks are used a lot for *automation*:
+If you want config-driven automation across methods:
 
-* **Intel Neural Compressor** again (does multi-framework automation). ([GitHub][14])
-* **DeepSpeed** compression modules for LLM sparsity and quantization. ([Deepchecks][15])
-* **SparseML / NeuralMagic**, low-rank / sparse finetuning tools, etc.
-* Commercial tools like [Pruna.ai](https://www.pruna.ai/), which wrap search over pruning/quantization strategies around PyTorch/ONNX models.
+- **DeepSpeed Compression** (quantization + pruning + distillation workflows): [DeepSpeed model compression tutorial][deepspeed-compression]
+- **LLM Compressor** (vLLM-focused compression toolkit): [vllm-project/llm-compressor][llm-compressor]
+- **Pruna** (commercial + OSS tooling): [Pruna docs][pruna]
 
-These usually provide:
-
-* Config-driven definitions of which layers to quantize/prune,
-* Automatic search over bitwidths/sparsity,
-* Optional KD.
+Note: older “SparseML” references exist, but the upstream repo is archived; treat it as legacy unless your org already depends on it.
 
 ---
 
-## 3. Example: GR00T-like robotics FM
+### 2.6 Example: GR00T-like robotics FM
 
-For a GR00T-style VLA you can try combining:
+A practical “first pass” for a GR00T-style VLA:
 
-1. **Baseline profiling** on your target (Jetson, Thor, TI SK-AM69, i.MX93, etc.).
-2. **PTQ 8-bit / FP8** on most transformer layers (vision + language backbones), keep diffusion/action heads in higher precision.
-3. **Structured pruning** of attention heads & MLP channels in the language trunk; maybe light pruning in vision backbone.
-4. **Distillation** to:
-
-   * a smaller VLA (fewer layers/heads), or
-   * task-specific students (e.g., just a manipulator policy) if you only need a subset of GR00T’s capabilities.
-5. Export to your deployment stack:
-
-   * NVIDIA path: PyTorch -> ModelOpt (quant+prune+KD) -> TensorRT engine.
-   * CPU / non-NVIDIA path: PyTorch -> INC / ONNX Runtime / TVM / ncnn with their PTQ flows (This maybe possible for some SoCs depending on computing & memory & DSP capacity.)
-
----
-
-## 4. Discussions
-
-In model optimization, you treat model as an algorithmic object: a graph with parameters, structure, and training data. The goal is to **reduce compute, memory, and latency while preserving (or sometimes trading off) task performance**.
-
-### 4.1 Parameter/computation reduction
-
-* **Quantization**
-  Lower the numeric precision of weights/activations (FP32 -> FP16/BF16 -> INT8/FP8/4-bit).
-
-  * *Benefits*: big cuts in memory bandwidth and throughput, often with negligible loss under good calibration or QAT.
-  * *Variants*: post-training quantization, quantization-aware training, mixed precision (critical parts stay higher precision).
-
-* **Pruning & sparsity**
-  Remove parameters or constrain them to sparse patterns.
-
-  * *Unstructured*: remove individual small-magnitude weights -> high compression, but needs sparse kernels to see speedups.
-  * *Structured*: drop whole channels, heads, blocks -> easier to accelerate and reason about.
-  * *Hardware-aligned*: N:M sparsity patterns that specific accelerators exploit.
-
-* **Low-rank / factorization**
-  Factor large matrices into low-rank pieces, or use adapters (LoRA-style) that reduce effective parameter count.
-
-  * Especially useful when you want *both* efficient finetuning and some inference savings (if you merge factors).
-
-### 4.2 Knowledge & behavior preservation
-
-Once you’ve made the model “smaller” or “cheaper,” you need to keep it smart:
-
-* **Knowledge distillation**
-  Train a smaller “student” to mimic a larger “teacher” via logits, features, or behaviors.
-
-  * Classic KD for classification/sequence tasks.
-  * Policy/behavior distillation for robotics, recommender systems, etc.
-
-* **Task-aware finetuning**
-  After quant/prune, you often do a short finetune (sometimes with KD) on the key downstream tasks to recover lost performance.
-
-### 4.3 Architectural & training tricks
-
-* **Architecture search & simplification**: choosing more hardware-friendly block structures (e.g., fewer attention heads, smaller FFNs, more depth-wise separable convs, etc.).
-* **Curriculum & multi-task strategies**: shaping how the model learns so it can later be compressed more aggressively without collapsing.
-* **Regularization for compressibility**: encouraging sparsity or low-rank structure during training so later pruning/quantization is easier.
-
-You can think of this layer as:
-
-> *“Given many hardware choices later, how do I make the core model inherently efficient and compressible?”*
+1. **Baseline profiling** on target (Jetson / server GPU / CPU box / SoC).
+2. **Quantize** most transformer layers (PTQ INT8/FP8/FP4 depending on hardware + stack); keep sensitive heads higher precision.
+3. **Structured pruning / 2:4 sparsity** only if your deployment engine has real sparse kernels for your shapes.
+4. **Distill**:
+   - smaller VLA, or
+   - task-specific students (e.g., manipulator-only policy).
+5. Export to the deployment stack:
+   - NVIDIA path: PyTorch -> ModelOpt -> TensorRT-LLM/TensorRT
+   - Intel path: PyTorch/HF -> OpenVINO IR -> NNCF -> OpenVINO runtime
+   - General path: PyTorch -> ONNX -> ORT / TVM / ncnn
+   - Mobile path: TF/PyTorch -> LiteRT
 
 ---
 
-Once you have a “compressed” or well-designed model, you still need to run it efficiently on **specific hardware**: GPUs, CPUs, NPUs, ASICs, microcontrollers, etc. This is where **compilers, runtimes, and system-level tricks** come in.
+## 3. Serving-time optimization (often the biggest real-world win)
 
-### 4.4 Graph-level optimization & compilation
+A useful mental model: cost splits into **prefill** (prompt processing) and **decode** (token-by-token).
+- **Prefill** is usually **compute-bound** (big GEMMs + attention).
+- **Decode** is often **memory / KV-cache bandwidth bound**.
 
-* **Operator fusion & graph rewriting**: Combine sequences of ops into single kernels, fold constants, pre-compute static parts.
-* **Layout & scheduling**: Choose memory layouts (NHWC vs NCHW, packed vs planar), tiling strategies, and stream scheduling to match caches and compute units.
-* **Backend selection**: Decide per-op implementation: CUDA vs TensorRT kernels vs cuDNN vs custom kernels, or CPU vs GPU vs NPU placement.
+So:
+- Weight-only INT4/FP4 helps decode *if* your stack has good kernels.
+- Better attention kernels (FlashAttention/FlashInfer) help prefill and reduce memory traffic.
+- KV-cache tricks matter most for long context and high concurrency.
 
-### 4.5 Hardware-aware quantization & formats
+### 3.1 Batching + scheduling + KV memory management
 
-Even if the model “supports INT8,” each hardware stack has its own preferred formats:
+If you do nothing else, choose a serving engine that gives you:
+- **continuous / dynamic batching**
+- **paged KV cache** (reduces fragmentation under concurrency)
+- optional **chunked prefill** (smooths very long prompts)
 
-* GPUs may prefer FP16/FP8/NVFP4;
-* CPUs often use INT8 with specific instruction sets;
-* Tiny MCUs use per-channel INT8 or INT4 with strict memory limits.
+Good entry points:
+- **vLLM**: PagedAttention + continuous batching + CUDA/HIP graph execution.  
+  Docs: [vLLM docs][vllm-docs] · Repo: [vllm-project/vllm][vllm-repo]
+- **Hugging Face Text Generation Inference (TGI)**: production server with dynamic batching + tensor parallelism.  
+  Docs: [TGI docs][tgi-docs] · Repo: [huggingface/text-generation-inference][tgi-repo]
+- **SGLang**: high-performance LLM serving framework + runtime stack.  
+  Repo: [sgl-project/sglang][sglang-repo]
 
-Edge-level toolchains take your **abstract quantization plan** (e.g., “these layers 8-bit, those 16-bit”) and map it to **actual kernels and calibration procedures** that match the device.
+> Reality check: feature parity differs (quant formats, speculative decoding, MoE, multi-modal, etc.).  
+> Always confirm against each runtime’s “supported hardware + quantization” tables.
 
-### 4.6 Runtime orchestration
+### 3.2 Kernel libraries that matter in practice
 
-* **Batching & concurrency**: trade off latency vs throughput, share accelerators across multiple models or clients.
-* **Memory management**: activation checkpointing, KV-cache management, overlapping copy+compute.
-* **Fallback paths**: when a kernel isn’t supported on a given accelerator, gracefully fall back to another device or a slower implementation.
+For transformer-heavy workloads, **attention + MLP kernels** are usually the make-or-break.
 
-You can think of this layer as:
+- **FlashAttention** (training + inference attention kernels): [Dao-AILab/flash-attention][flashattn]
+- **FlashInfer** (serving-focused kernels: attention, paged attention, sampling, etc.):  
+  Repo: [flashinfer-ai/flashinfer][flashinfer] · Docs: [flashinfer.ai docs][flashinfer-docs]
 
-> *“Given this fixed model, how do I turn it into a hardware-specific engine that squeezes every millisecond and watt on the target device?”*
+### 3.3 KV-cache optimization for long context + high concurrency
+
+When context length or concurrency grows, KV cache can dominate VRAM and drive latency cliffs.
+
+Two complementary strategies:
+- **Systems**: paged KV cache + chunked prefill (runtime feature).
+- **Model-side**: KV cache **quantization/compression** (typically 4–8 bit; often mixed precision).
+
+Researchy-but-usable codebases:
+- **KVQuant**: [SqueezeAILab/KVQuant][kvquant]
+- **ZipCache**: [ThisisBillhe/ZipCache][zipcache]
+
+### 3.4 Decoding acceleration (reduce target-model forward passes)
+
+If decode is the bottleneck, you can reduce the number of expensive target-model steps:
+- **Speculative decoding** (draft model + verification): [romsto/Speculative-Decoding][specdec]
+- **Multi-token heads** (Medusa): [FasterDecoding/Medusa][medusa]
 
 ---
 
-## 5. How the two layers interact
+## 4. Deployment lanes by hardware (quick cheat sheet)
 
-In reality, these aren’t sequential, they’re a **feedback loop**:
+### NVIDIA GPUs / Jetson / Blackwell-class
 
-1. **Profile on a target** -> identify slow/energy-hungry parts.
-2. **Model-level changes** (quantize/prune/distill/architectural tweaks) targeting those hotspots.
-3. **Recompile & redeploy** with hardware-specific toolchains.
-4. **Measure again** -> iterate.
+- **NVIDIA Model Optimizer (ModelOpt)** for PTQ/QAT + sparsity/distillation:  
+  Docs: [ModelOpt docs][modelopt-docs] · Repo: [NVIDIA/Model-Optimizer][modelopt-repo]
+- **TensorRT-LLM** for engine build + kernels + serving:  
+  Docs: [TensorRT-LLM docs][tensorrt-llm-docs] · Repo: [NVIDIA/TensorRT-LLM][tensorrt-llm-repo]
 
-A few key patterns:
+### AMD GPUs (ROCm/HIP) + non-NVIDIA datacenter
 
-* **Co-design**:
-  You don’t just compress blindly. You compress *where the hardware benefits most* (e.g., prune MLP channels on GPU, but keep convolutions dense if they’re already well-optimized).
+- Serving engines like **vLLM** can run with **HIP** backends; quantization support is more kernel-dependent and can be narrower than NVIDIA.
+- PyTorch **torch.compile** (Inductor) is a good “graph+kernel” optimization baseline across NVIDIA/AMD/Intel GPUs (via Triton):  
+  API: [torch.compile][torch-compile] · Guide: [torch.compiler docs][torch-compiler-guide]
 
-* **Multi-target thinking**:
-  One “model-level family” with multiple “deployment variants”:
+### CPUs (x86 + ARM servers)
 
-  * High-precision / large model for cloud,
-  * Aggressively quantized / distilled variant for edge.
+First levers:
+- smaller model (distill) and/or weight-only quantization (INT8/INT4).
 
-* **Task-aware metrics**:
-  It’s not enough to only track FLOPs/latency; you track **task-level degradation** (success rate, safety, robustness) and treat those as constraints in your optimization loop.
+Runtimes:
+- **OpenVINO + NNCF** (Intel-heavy deployments): [OpenVINO][openvino] · [NNCF repo][nncf-repo]
+- **ONNX Runtime** (cross-platform): [ORT quantization docs][ort-quant]
+- **ONNX Runtime GenAI** (generation loop tooling): [microsoft/onnxruntime-genai][ort-genai]
+- **llama.cpp** (local C++ inference; GGUF ecosystem): [ggml-org/llama.cpp][llamacpp]
+
+### Apple silicon (laptop / mobile-class SoC)
+
+- **MLX** for training + inference on Apple silicon: [MLX repo][mlx] · [MLX docs][mlx-docs]
+- LLM-oriented tooling: [mlx-lm][mlx-lm]
+- App conversion pipeline: **coremltools**: [Repo][coremltools] · [Guide][coremltools-guide]
+
+### Android / Qualcomm / embedded SoCs
+
+- **LiteRT** (ex-TFLite) runtime + delegates:  
+  Docs: [LiteRT][litert] · Repo: [google-ai-edge/LiteRT][litert-repo] · Samples: [litert-samples][litert-samples]  
+  LLM pipeline: [google-ai-edge/LiteRT-LM][litert-lm]
+- **ExecuTorch** (PyTorch -> on-device runtime): [Docs][executorch] · [Repo][executorch-repo]
+- **ONNX Runtime + QNN EP** (Qualcomm acceleration): [ORT QNN EP docs][ort-qnn] · [Qualcomm ORT QNN EP docs][qnn-ort-docs]
+
+### “Runs everywhere” local inference engines
+
+These are often the fastest way to get something working across laptops + edge boxes:
+- **MLC LLM** (TVM-based compiler + runtime for LLM deployment): [mlc-ai/mlc-llm][mlc-llm] · [MLC LLM docs][mlc-llm-docs]
+- **llama.cpp** (GGUF + broad backend support): [llamacpp][llamacpp]
 
 ---
 
-## 6. Concluding thoughts
+## 5. Beyond LLMs: VLMs + diffusion model optimization in robotics
 
-* **Model optimization and edge optimization are inseparable.**
-  A beautifully compressed model that doesn’t match hardware capabilities can be slower than a larger but hardware-friendly one. Conversely, a sophisticated compiler can’t save an over-sized, poorly structured model.
+### VLMs / VLAs
 
-* **The “mainstream toolbox” is converging.**
-  Across vision, language, and robotics, everyone is reaching for the same core tools—quantization, pruning/sparsity, distillation, low-rank tricks—then handing the result to increasingly capable compilers/runtimes.
+- Optimize **each submodule separately** (vision encoder, LLM, action head) and re-profile end-to-end.
+- Watch for non-model bottlenecks: image decode, resizing, tokenization, simulator/robot loop.
 
-* **The frontier is in *joint* design.**
-  The most compelling work now treats:
+### Diffusion / image generation
 
-  * model architecture,
-  * training strategy,
-  * compression plan, and
-  * deployment stack
-    as a single co-designed system, rather than separate phases.
+Two big levers:
+- **Reduce steps** (often bigger win than faster steps): Latent Consistency Models (LCM): [luosiallen/latent-consistency-model][lcm]
+- **Make each step faster** (quantize/compile kernels):
+  - Diffusers bitsandbytes quantization guide: [Diffusers bitsandbytes quantization][diffusers-bnb]
+  - Reference implementations / research code: [Stability-AI/generative-models][stability-generative-models]
 
-* **For robotics and other real-world systems**, the optimization objective is not just “tokens per second” or “images per second,” but **safe, robust behavior under tight compute and power budgets**. That makes the two-layer view, *first shape the model, then specialize it to hardware, then iterate*, a practical framework for building foundation-model-driven systems that can actually leave the lab and live on edge devices.
+---
 
+## 6. Minimal “what should I do first?” decision tree
 
-[1]: https://aclanthology.org/2024.tacl-1.85.pdf
-[2]: https://www.edge-ai-vision.com/2025/08/optimizing-llms-for-performance-and-accuracy-with-post-training-quantization/
-[3]: https://nvidia.github.io/TensorRT-Model-Optimizer/
-[4]: https://developer.nvidia.com/blog/pruning-and-distilling-llms-using-nvidia-tensorrt-model-optimizer/
-[5]: https://github.com/NVIDIA/TensorRT-Model-Optimizer
-[6]: https://docs.pytorch.org/tutorials/beginner/knowledge_distillation_tutorial.html
-[7]: https://developer.nvidia.com/blog/nvidia-hardware-innovations-and-open-source-contributions-are-shaping-ai/
-[8]: https://www.intel.com/content/www/us/en/developer/articles/technical/an-easy-introduction-to-intel-neural-compressor.html
-[9]: https://think.in2p3.fr/2023/06/14/compressing-the-transformer-optimization-of-distilbert-with-the-intel-neural-compressor/
-[10]: https://arxiv.org/abs/2507.16099
-[11]: https://docs.pytorch.org/tutorials/deep-dive.html
-[12]: https://docs.pytorch.org/tutorials/intermediate/pruning_tutorial.html
-[13]: https://medium.com/%40akankshasinha247/model-compression-quantization-distillation-b5006cf41546
-[14]: https://github.com/intel/neural-compressor
-[15]: https://www.deepchecks.com/llm-pruning-and-distillation-importance/
+1. **Profile** and label the bottleneck: **weights** vs **KV cache** vs **kernels** vs **scheduling**.
+2. If **decode/VRAM** dominates -> start with **weight-only INT4/FP4**, but only if your runtime supports it well.
+3. If **long context/concurrency** dominates -> fix **paged KV + chunked prefill**, then consider **KV cache quantization**.
+4. If **prefill compute** dominates -> better kernels (FlashAttention/FlashInfer) + compile (torch.compile / TensorRT).
+5. If you still can’t hit constraints -> **distill** (often the only way to cut both compute *and* memory).
+
+---
+
+## 7. Closing remarks
+
+- **Model optimization and deployment optimization are inseparable.**
+- Most “wins” come from **matching a compression method to the runtime’s kernels**.
+- Treat it as a feedback loop: profile -> compress -> compile -> measure -> iterate.
+
+<!-- References / links -->
+
+[survey-llm-compression]: https://aclanthology.org/2024.tacl-1.85.pdf
+
+<!-- Quantization methods -->
+[smoothquant]: https://github.com/mit-han-lab/smoothquant
+[awq]: https://github.com/mit-han-lab/llm-awq
+
+<!-- NVIDIA stacks  -->
+[modelopt-repo]: https://github.com/NVIDIA/Model-Optimizer
+[modelopt-docs]: https://nvidia.github.io/Model-Optimizer/
+[tensorrt-llm-repo]: https://github.com/NVIDIA/TensorRT-LLM
+[tensorrt-llm-docs]: https://nvidia.github.io/TensorRT-LLM/
+[tensorrt-quantized-types]: https://docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/work-quantized-types.html
+[nvfp4-blog]: https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/
+[modelopt-hf-collection]: https://huggingface.co/collections/nvidia/inference-optimized-checkpoints-with-model-optimizer
+
+<!-- Sparsity -->
+[cusparselt]: https://docs.nvidia.com/cuda/cusparselt/
+[torchao-sparsity]: https://docs.pytorch.org/ao/stable/sparsity.html
+
+<!-- Distillation -->
+[pytorch-kd]: https://docs.pytorch.org/tutorials/beginner/knowledge_distillation_tutorial.html
+[modelopt-distill]: https://nvidia.github.io/Model-Optimizer/guides/distillation.html
+
+<!-- LoRA / PEFT -->
+[lora]: https://github.com/microsoft/LoRA
+[peft]: https://github.com/huggingface/peft
+
+<!-- Intel stacks -->
+[openvino]: https://www.intel.com/content/www/us/en/developer/tools/openvino-toolkit/overview.html
+[openvino-modelopt]: https://docs.openvino.ai/2025/openvino-workflow/model-optimization.html
+[nncf-repo]: https://github.com/openvinotoolkit/nncf
+[optimum-intel-openvino]: https://huggingface.co/docs/optimum-intel/en/openvino/optimization
+[inc-docs]: https://intel.github.io/neural-compressor/
+[inc-repo]: https://github.com/intel/neural-compressor
+
+<!-- PyTorch-native optimization -->
+[torchao-docs]: https://pytorch.org/ao/
+[torchao-repo]: https://github.com/pytorch/ao
+[torchao-qat]: https://docs.pytorch.org/ao/stable/api_ref_qat.html
+[pt2e-ptq]: https://docs.pytorch.org/ao/stable/tutorials_source/pt2e_quant_ptq.html
+[pt2e-qat]: https://docs.pytorch.org/ao/stable/tutorials_source/pt2e_quant_qat.html
+[torch-pruning]: https://github.com/VainF/Torch-Pruning
+
+<!-- General runtimes -->
+[ort-quant]: https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html
+[litert]: https://ai.google.dev/edge/litert
+[litert-repo]: https://github.com/google-ai-edge/LiteRT
+[tvm]: https://tvm.apache.org/
+[ncnn]: https://github.com/Tencent/ncnn
+
+<!-- Automation frameworks -->
+[deepspeed-compression]: https://www.deepspeed.ai/tutorials/model-compression/
+[llm-compressor]: https://github.com/vllm-project/llm-compressor
+[pruna]: https://docs.pruna.ai/en/stable/compression.html
+
+<!-- GR00T -->
+[groot-n15]: https://research.nvidia.com/labs/gear/gr00t-n1_5/
+[isaac-groot]: https://github.com/NVIDIA/Isaac-GR00T
+
+<!-- Serving engines / kernels -->
+[vllm-docs]: https://docs.vllm.ai/en/latest/
+[vllm-repo]: https://github.com/vllm-project/vllm
+[tgi-docs]: https://huggingface.co/docs/text-generation-inference/en/index
+[tgi-repo]: https://github.com/huggingface/text-generation-inference
+[sglang-repo]: https://github.com/sgl-project/sglang
+[flashattn]: https://github.com/Dao-AILab/flash-attention
+[flashinfer]: https://github.com/flashinfer-ai/flashinfer
+[flashinfer-docs]: https://docs.flashinfer.ai/
+
+<!-- KV cache + decoding acceleration -->
+[kvquant]: https://github.com/SqueezeAILab/KVQuant
+[zipcache]: https://github.com/ThisisBillhe/ZipCache
+[specdec]: https://github.com/romsto/Speculative-Decoding
+[medusa]: https://github.com/FasterDecoding/Medusa
+
+<!-- PyTorch compile / export -->
+[torch-compile]: https://docs.pytorch.org/docs/stable/generated/torch.compile.html
+[torch-compiler-guide]: https://docs.pytorch.org/docs/main/user_guide/torch_compiler/torch.compiler.html
+
+<!-- Local inference engines -->
+[llamacpp]: https://github.com/ggml-org/llama.cpp
+[ort-genai]: https://github.com/microsoft/onnxruntime-genai
+[mlc-llm]: https://github.com/mlc-ai/mlc-llm
+[mlc-llm-docs]: https://llm.mlc.ai/
+
+<!-- Apple / Core ML -->
+[mlx]: https://github.com/ml-explore/mlx
+[mlx-docs]: https://ml-explore.github.io/mlx/
+[mlx-lm]: https://github.com/ml-explore/mlx-lm
+[coremltools]: https://github.com/apple/coremltools
+[coremltools-guide]: https://apple.github.io/coremltools/docs-guides/
+
+<!-- LiteRT / ExecuTorch / Qualcomm -->
+[litert-samples]: https://github.com/google-ai-edge/litert-samples
+[litert-lm]: https://github.com/google-ai-edge/LiteRT-LM
+[executorch]: https://docs.pytorch.org/executorch/index.html
+[executorch-repo]: https://github.com/pytorch/executorch
+[ort-qnn]: https://onnxruntime.ai/docs/execution-providers/QNN-ExecutionProvider.html
+[qnn-ort-docs]: https://docs.qualcomm.com/bundle/publicresource/topics/80-62010-1/ort-qnn-ep.html
+
+<!-- Diffusion / VLM extras -->
+[lcm]: https://github.com/luosiallen/latent-consistency-model
+[diffusers-bnb]: https://huggingface.co/docs/diffusers/en/quantization/bitsandbytes
+[stability-generative-models]: https://github.com/Stability-AI/generative-models
