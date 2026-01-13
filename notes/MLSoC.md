@@ -1,260 +1,292 @@
 # ML Training & Inference on SoCs: the Other-than-CUDA Landscape
 
-**An T. Le, Hanoi, Dec 2025.**
+**An T. Le, Hanoi, Dec 2025 (revised Jan 2026)**
 
-On NVIDIA, life is simple: you live in **CUDA-land**, and everything important eventually compiles down to it.
+On NVIDIA, the world is unusually simple: most performance work bottoms out in **CUDA**.
 
-On ARM-based SoCs, at the time of writing, there is no single “CUDA for everything”-but there *is* an increasingly coherent stack of tools that, together, fill the same role:
+On **ARM-based SoCs** (phones, tablets, SBCs, embedded boards), there is no single “CUDA for everything”. What you get instead is a *layered stack*:
 
-* low-level GPU/NPU APIs
-* ARM-optimized kernel libraries
-* ML compilers and runtimes
-* vendor-specific SoC SDKs
+1. **Low-level compute APIs** (GPU/NPU “assembly language”)
+2. **CPU/GPU kernel libraries** (cuBLAS/cuDNN analogues)
+3. **Graph runtimes + ML compilers** (the “TensorRT/XLA-ish” layer)
+4. **Vendor SDKs** that glue accelerators into something usable
 
-This note is a quick tour of that landscape, with links to codebases and docs for easy access. Note that this blog is nowhere near exhaustive as I highly likely miss some emergent pathways.
+This note is a *practical map* of that ecosystem with codebases + docs you can jump into quickly.
+
+---
+
+## 0. A quick “what stack should I touch?” cheat sheet
+
+### If you ship an Android app (phones/tablets)
+- Start: **LiteRT** (ex‑TensorFlow Lite) delegates (GPU / vendor NPUs), or **ONNX Runtime Mobile**
+- If you’re PyTorch-first: **ExecuTorch**
+- Only go low-level (Vulkan/OpenCL) if you’re building a custom runtime or kernels.
+
+### If you ship on Apple silicon (iPhone/iPad/Mac)
+- Deployment: **Core ML** (best path to Apple Neural Engine)
+- Research / local fine-tuning: **MLX** (CPU+GPU via Metal; great ergonomics)
+- Low-level: **Metal** / **MPS** if you’re writing custom kernels.
+
+### If you ship embedded Linux boards (robotics / edge boxes)
+- Start with the **vendor SDK** (TI TIDL, Qualcomm QNN, NXP eIQ, Rockchip RKNN, …)
+- If you want one runtime across boards: **TVM / IREE / ONNX Runtime**
+- For local LLMs on ARM: **llama.cpp**, **MLC‑LLM**, **MNN**.
+
+### If you ship on microcontrollers (TinyML)
+- Start: **LiteRT for Microcontrollers**, **CMSIS‑NN**, optionally **Ethos‑U + Vela**
+- TVM path: **microTVM** (if you want compiler-driven deployment).
 
 ---
 
 ## 1. Low-level compute APIs: the “CUDA-ish” layer
 
-### Vulkan compute & Kompute
+These are the primitives everything else eventually targets.
 
-On many ARM SoCs (Adreno, Mali, etc.), the modern low-level compute API is **Vulkan** with compute shaders (SPIR-V). Instead of writing raw Vulkan boilerplate, you can use:
+### Vulkan compute (SPIR‑V) + Kompute
 
-* **[Kompute](https://github.com/KomputeProject/kompute)** - a general-purpose GPU compute framework on top of Vulkan, targeting “1000s of cross vendor graphics cards (AMD, Qualcomm, NVIDIA & friends)” and explicitly supporting mobile.
+For **mobile GPUs** (Adreno, Mali, etc.), modern cross-vendor compute is typically **Vulkan** compute shaders.
 
-Kompute gives you tensor-like abstractions, dispatch helpers, and cross-platform support, which makes it feel much closer to CUDA while still working across desktop + mobile GPUs.
+If you don’t want raw Vulkan boilerplate:
+- **Kompute (Vulkan compute framework):** https://github.com/KomputeProject/kompute  
+  A nice “CUDA-ish” abstraction layer with cross-platform dispatch helpers.
 
-If you want to write custom kernels, physics/vision ops, or exotic inference backends on Adreno/Mali, **Vulkan + Kompute** is the closest thing to "CUDA on ARM" you’ll get today.
+When Vulkan matters:
+- Custom ops (vision/physics/signal processing)
+- Non-standard kernels that delegates/runtimes don’t support
+- You need one GPU backend across many Android devices
 
----
+### OpenCL (still relevant nowadays, but driver-dependent)
 
-### OpenCL (legacy but still around)
+OpenCL is “older” than Vulkan compute, but it’s still relevant:
+- **ARM Compute Library (ACL)** uses OpenCL for Mali GPU acceleration paths.
+- Some edge inference stacks and research code still target OpenCL directly.
 
-On some devices, especially older Mali GPUs and certain embedded boards, **OpenCL** is still supported and is used under the hood by things like the **[ARM Compute Library’s](https://software-dl.ti.com/processor-sdk-linux/esd/AM62PX/11_01_16_13/exports/docs/linux/Foundational_Components/Machine_Learning/arm_compute_library.html)** GPU path.
+If you can choose today: prefer Vulkan for “future-proof” Android GPU work, but keep OpenCL in your toolbox when the vendor stack expects it.
 
-For *new* designs, Vulkan is the better long-term bet; OpenCL is mainly relevant if you’re stuck with legacy drivers.
+### Apple: Metal + MPS
 
----
-
-### Metal + MPS (Apple SoCs)
-
-Not generic ARM, but worth mentioning: on M-series and A-series SoCs, **Metal** plus **Metal Performance Shaders (MPS)** is essentially Apple’s CUDA equivalent, and it’s now wrapped very nicely by:
-
-* **[MLX](https://github.com/ml-explore/mlx)** - Apple’s NumPy-like array and neural-net framework optimized for Apple silicon.
-
-If you treat an M2/M4/M-whatever laptop as a “fat SoC”, MLX is currently the state-of-the-art training+inference stack.
-
----
-
-## 2. ARM-optimized kernel libraries: the cuBLAS/cuDNN analogues
-
-### ARM Compute Library (ACL) & ARM NN
-
-The **[ARM Compute Library](https://www.arm.com/products/development-tools/embedded-and-software/compute-library)** is a collection of hand-tuned primitives (conv, GEMM, activations, etc.) for **ARM Cortex-A/Neoverse CPUs and Mali GPUs**, using NEON/SVE and OpenCL.
-
-On top of it sits **[ARM NN](https://github.com/ARM-software/armnn)**, a higher-level inference engine that can take TF, [TFLite](https://arm-software.github.io/armnn/23.11/delegate.html), [ONNX](https://onnxruntime.ai/docs/execution-providers/NNAPI-ExecutionProvider.html) and map them onto CPU/GPU/NPUs (Ethos-U/N) using those kernels and NNAPI where appropriate.
-
-You’ll bump into ACL / ARM NN indirectly in:
-
-* NXP’s **eIQ** stack for i.MX
-* Some Android NNAPI drivers
-* Certain ARM-optimized builds of PyTorch / TF
+On Apple SoCs, **Metal** is the low-level GPU API and **Metal Performance Shaders (MPS)** is the “fast kernels” layer:
+- Metal: https://developer.apple.com/metal/
+- MPS: https://developer.apple.com/documentation/metalperformanceshaders
 
 ---
+
+## 2. Kernel libraries: cuBLAS/cuDNN analogues (CPU-first on SoCs)
+
+### ARM Compute Library (ACL)
+
+- **Repo:** https://github.com/ARM-software/ComputeLibrary  
+  Hand-tuned primitives for ARM CPUs (NEON/SVE/SVE2) and Mali GPUs (OpenCL).
+
+ACL is often *indirectly* consumed via higher runtimes (ARM NN, frameworks, vendor SDKs).
+
+Good starting points:
+- ACL docs + build guides live in the repo (see “Documentation” section in README).
+- ARM tutorial referenced by the repo: “AlexNet on Raspberry Pi” (linked from ACL README).
+
+### ARM NN (Arm’s inference runtime)
+
+- **Repo:** https://github.com/ARM-software/armnn  
+- **Docs:** https://arm-software.github.io/armnn/
+
+> Key reality check (2026):
+> - ARM NN’s **recommended integration** is via the **TF Lite Delegate**.
+> - It supports **TensorFlow Lite** and **ONNX** models (parsers exist but have less coverage than the delegate).
+> - Ethos integration is primarily **Ethos‑N** (Linux-class NPUs). For **Ethos‑U** (microcontrollers), you usually go through LiteRT Micro + Vela, not ARM NN.
+
+If you’re on Android and want “Arm acceleration without writing kernels”:
+- ARM also maintains an Android NN driver/HAL integration for ARM IP (see ARM NN README links).
+
+### XNNPACK (mobile CPU inference workhorse)
+
+- **Repo:** https://github.com/google/XNNPACK  
+XNNPACK is a highly-optimized CPU operator library widely used under-the-hood (not usually called directly). It shows up as:
+- LiteRT/TFLite CPU backend
+- ONNX Runtime’s **XNNPACK Execution Provider**: https://onnxruntime.ai/docs/execution-providers/Xnnpack-ExecutionProvider.html
 
 ### oneDNN on AArch64
 
-Intel’s **[oneDNN](https://github.com/uxlfoundation/oneDNN)** (part of oneAPI) is not just for x86: it explicitly supports **ARM 64-bit (AArch64)** and is used as a high-performance CPU backend in many frameworks.
+- **Repo:** https://github.com/uxlfoundation/oneDNN  
+oneDNN supports **AArch64** and is a common “fast CPU math” backend in larger stacks.
 
-On ARM servers or SoCs where CPU is your main workhorse (e.g., LLM inference on Neoverse or Graviton), [oneDNN](https://uxlfoundation.github.io/oneDNN/) is the “good math library” underneath a lot of stacks (PyTorch, ONNX Runtime, vLLM CPU backends, etc.).
+### ARM KleidiAI (new-ish CPU micro-kernel layer)
 
----
+- **Repo:** https://github.com/ARM-software/kleidiai  
+KleidiAI provides optimized micro-kernels (notably relevant for low-bit GEMM/GEMV patterns showing up in LLM inference).
 
-## 3. ML compilers & runtimes: the “XLA/TensorRT” of SoCs
+### TinyML kernels: CMSIS‑NN
 
-### Apache TVM
-
-**[Apache TVM](https://tvm.apache.org/)** is an open ML compiler that takes pre-trained models (PyTorch, TF, ONNX, etc.) and generates optimized code for CPUs, GPUs and specialized accelerators.
-
-Why it matters for SoCs:
-
-* Targets **ARM CPUs**, **Mali GPUs**, and various NPUs via vendor integrations.
-* Can be the **single compiler** feeding multiple SoCs (RB8, AM68A, i.MX93…) with different backends.
-* Powers or integrates with vendor stacks (e.g., TI’s Edge AI, parts of NXP eIQ).
-
-TVM is one of the few serious options if you want a *unified* compiler that still lets you squeeze each SoC properly.
+For Cortex‑M microcontrollers:
+- **CMSIS‑NN:** https://github.com/ARM-software/CMSIS-NN  
+This is the “fast int8 kernels” layer for TinyML deployments.
 
 ---
+
+## 3. Graph runtimes & ML compilers: the “TensorRT/XLA” layer for SoCs
+
+These sit above low-level APIs and try to give you portability + performance.
+
+### LiteRT (formerly TensorFlow Lite)
+
+- **Overview:** https://ai.google.dev/edge/litert/overview  
+- **Repo:** https://github.com/google-ai-edge/LiteRT  
+- **GPU delegate docs:** https://ai.google.dev/edge/litert/performance/gpu  
+- **Microcontrollers:** https://ai.google.dev/edge/litert/microcontrollers/overview
+
+Use LiteRT when:
+- You want the “default Android/embedded path”
+- You rely on delegates (GPU, vendor NPU integrations, etc.)
+- You want strong tooling around conversion and mobile deployment
+
+### ExecuTorch (PyTorch on-device runtime)
+
+- **Main docs:** https://docs.pytorch.org/executorch/
+- **Qualcomm QNN backend tutorial:** https://docs.pytorch.org/executorch/stable/backends-qualcomm.html
+- **MediaTek backend:** https://docs.pytorch.org/executorch/1.0/backends-mediatek.html
+
+ExecuTorch is a good “PyTorch-native” way to export + run models on phones/edge devices, while still hitting vendor accelerators.
+
+### ONNX Runtime (ORT) on mobile + edge
+
+- **ORT Mobile:** https://onnxruntime.ai/docs/get-started/with-mobile.html  
+- **Execution providers overview:** https://onnxruntime.ai/docs/execution-providers/  
+- **QNN EP:** https://onnxruntime.ai/docs/execution-providers/QNN-ExecutionProvider.html  
+- **XNNPACK EP:** https://onnxruntime.ai/docs/execution-providers/Xnnpack-ExecutionProvider.html  
+
+LLM-specific:
+- **onnxruntime-genai (generate loop + KV cache management):** https://github.com/microsoft/onnxruntime-genai  
+- Docs: https://onnxruntime.ai/docs/genai/
+
+ORT is especially useful when:
+- Your model pipeline is ONNX-first
+- You want to swap acceleration backends via EPs (QNN, CoreML, XNNPACK, etc.)
+- You want a single engine across Android + embedded Linux
+
+### Apache TVM (+ microTVM)
+
+- **TVM:** https://tvm.apache.org/  
+- **microTVM design doc:** https://tvm.apache.org/docs/arch/microtvm_design.html  
+
+TVM is compelling when:
+- You want a programmable compiler (schedules, auto-tuning, custom backends)
+- You’re spanning heterogeneous devices (CPU + GPU + NPU)
 
 ### IREE (MLIR-based compiler + runtime)
 
-**[IREE](https://iree.dev/)** is an MLIR-based end-to-end compiler and runtime that lowers models to a unified IR and then to hardware-specific backends like CPU, **Vulkan (Mali/Adreno)**, Metal, and CUDA.
+- **IREE:** https://iree.dev/  
+IREE lowers via MLIR to backends including CPU and Vulkan (mobile GPUs), aiming for a unified compiler toolchain.
 
-For SoCs, the interesting path is:
+### “LLM-first on device”: MLC‑LLM, llama.cpp, ncnn, MNN
 
-> Framework (PyTorch/TF/JAX) -> MLIR -> IREE -> **Vulkan SPIR-V on mobile GPU** or **ARM CPU**
+If your *main* workload is **LLM inference on edge/mobile**:
 
-This lets you share most of your toolchain between datacenter and edge, with only the final backend differing.
+- **vLLM (CPU on ARM / server-class ARM):** https://docs.vllm.ai/en/latest/getting_started/installation/cpu/ 
+  A high-throughput serving engine; on ARM it targets the **CPU backend** (NEON), useful for *server-class* AArch64 or beefy edge boxes.
 
----
+- **MLC‑LLM:** https://llm.mlc.ai/  
+  Uses “TVM Unity” to compile models; targets Metal/Vulkan/OpenCL backends depending on platform.
 
-### ncnn (Vulkan-first mobile runtime)
+- **llama.cpp:** https://github.com/ggml-org/llama.cpp  
+  Practical, minimal-dependency LLM inference across CPU (NEON/SVE), Metal, Vulkan/OpenCL (varies by build/target).
 
-**[ncnn](https://github.com/Tencent/ncnn)** is a lightweight C++ NN inference framework designed from day one for mobile and embedded. It has:
+- **ncnn:** https://github.com/Tencent/ncnn  
+  Mobile-first C++ inference engine with a strong Vulkan path (popular for CV models on Android).
 
-* CPU kernels optimized for mobile
-* A strong **Vulkan backend** for GPU acceleration on Android/ARM.
-
-If you want a **minimal dependency**, high-performance inference engine for Android phones, SBCs, or simple robots, ncnn is a very practical option.
-
----
-
-### ExecuTorch & LiteRT (ex-TensorFlow Lite)
-
-For graph-level runtimes on-device:
-
-* **[ExecuTorch](https://pytorch.org/projects/executorch/)** is [PyTorch’s unified on-device runtime](https://docs.pytorch.org/executorch/index.html), with backends for CPUs, GPU delegates and SoC-specific accelerators like Qualcomm QNN.
-* **[LiteRT](https://ai.google.dev/edge/litert)** (formerly TensorFlow Lite) remains the [standard TFLite runtime](https://ai.google.dev/edge/litert) for Android/embedded, with delegates for NNAPI, GPU, and vendor NPUs.
-
-These don’t replace low-level APIs; they sit *above* them and route ops to NNAPI, QNN, GPU delegates, etc.
-
----
-
-### LLM-focused: vLLM on ARM
-
-If your main concern is LLM inference:
-
-* **[vLLM](https://github.com/vllm-project/vllm)** is a high-throughput library for LLM serving that now supports non-x86 architectures, including ARM, when paired with appropriate BLAS / oneDNN backends.
-
-On ARM servers or beefy SoCs where CPU is dominant, vLLM + oneDNN/ACL is a realistic way to run sizeable models.
+- **MNN:** https://github.com/alibaba/MNN  
+  Lightweight engine with strong on-device focus (and a lot of real-world Android usage inside Alibaba’s ecosystem).
 
 ---
 
 ## 4. Vendor SoC stacks: “CUDA for X”
 
-This is where things get very SoC-specific. Each vendor now ships something that *behaves* like “CUDA + cuDNN” for their particular mix of CPU/GPU/NPU.
+This layer is where you get the best perf/W — but also the most vendor specificity.
 
-### Qualcomm Snapdragon / QRB / RB8
+### Qualcomm (Snapdragon / QRB / RB-class robotics)
 
-For RB8-class robotics boards and Snapdragon phones, the key piece is:
+- **Qualcomm AI Engine Direct / QNN SDK:** https://www.qualcomm.com/developer/software/qualcomm-ai-engine-direct-sdk  
+Integration points:
+- ExecuTorch QNN backend (docs above)
+- ORT QNN EP (docs above)
 
-* **[Qualcomm AI Engine Direct / QNN SDK](https://www.qualcomm.com/developer/software/qualcomm-ai-engine-direct-sdk)** - a set of low-level APIs and tools to target CPU, Adreno GPU, and Hexagon Tensor Processor from one abstraction.
+### MediaTek (NeuroPilot)
 
-It plugs into:
+- **NeuroPilot portal:** https://neuropilot.mediatek.com/  
+- LiteRT has an explicit guide for NeuroPilot integration: https://ai.google.dev/edge/litert/next/mediatek
 
-* **ExecuTorch Qualcomm backend** (tutorial [here](https://docs.pytorch.org/executorch/stable/build-run-qualcomm-ai-engine-direct-backend.html))
-* **ONNX Runtime QNN Execution Provider** (see [here](https://onnxruntime.ai/docs/execution-providers/QNN-ExecutionProvider.html) and [Qualcomm docs](https://docs.qualcomm.com/nav/home/index_QNN.html?product=1601111740009302]))
+### TI (Jacinto / AM68A / AM69A)
 
-In practice: **you train on GPUs elsewhere, convert to ONNX or ExecuTorch, then deploy via QNN** for extremely efficient mixed-precision inference on RB8.
+- **TI Edge AI SDK:** https://software-dl.ti.com/jacinto7/esd/processor-sdk-linux-am68a/latest/exports/docs/linux/index_Edge_AI.html  
+- **TIDL tools:** https://github.com/TexasInstruments/edgeai-tidl-tools  
 
----
+TI’s stack is strong when you need a full capture→preprocess→infer pipeline (often with GStreamer/OpenVX integration).
 
-### Texas Instruments Jacinto / AM68A / AM69A
+### NXP i.MX (eIQ)
 
-On TI’s AM6xA boards (Jacinto for edge AI / robotics), the relevant stack is:
+- **eIQ environment:** https://www.nxp.com/design/design-center/software/eiq-ai-development-environment%3AEIQ  
+- **i.MX Machine Learning User’s Guide (UG10166):** https://www.nxp.com/docs/en/user-guide/UG10166.pdf  
 
-* **[Edge AI SDK](https://software-dl.ti.com/jacinto7/esd/processor-sdk-linux-am68a/latest/exports/docs/linux/index_Edge_AI.html)** - system-level SDK with GStreamer, vision components, and AI tooling.
-* **[TIDL](https://github.com/TexasInstruments/edgeai-tidl-tools)** (TI Deep Learning) - tools and runtimes to compile TFLite / ONNX / TVM models for the C7xMMA AI accelerator + ARM cores.
+> Reality check 2026: vendors sometimes remove/shift supported frontends over time. UG10166 notes removed components (e.g., TensorFlow parser) and current supported parsers/runtime paths.
 
-This gives you a pretty complete **capture -> preprocess -> infer -> postprocess** pipeline for vision and perception on AM68A/AM69A with good power/perf trade-offs.
+### Rockchip (RK3588, etc.)
 
----
+- **RKNN Toolkit2:** https://github.com/rockchip-linux/rknn-toolkit2  
+- **RKNPU2 runtime:** https://github.com/rockchip-linux/rknpu2  
+- **RKNN‑LLM:** https://github.com/airockchip/rknn-llm  
 
-### NXP i.MX (incl. i.MX93)
-
-NXP’s answer is **[eIQ](https://www.nxp.com/design/design-center/software/eiq-ai-development-environment%3AEIQ)** - a full AI software environment for i.MX. (see [docs](https://www.nxp.com/docs/en/user-guide/UG10166.pdf))
-
-According to the recent **i.MX Machine Learning User’s Guide**, eIQ supports multiple inference engines (TFLite, ONNX Runtime, PyTorch, OpenCV) and maps them onto Cortex-A, GPUs, and NPUs across i.MX 8/9 families, including **i.MX93**.
-
-Under the hood it blends:
-
-* ARM NN / ACL
-* CMSIS-NN for MCUs
-* Vendor NPU runtimes and compilers
-
-So on i.MX, **eIQ is your entry point**; TVM can also be integrated via Yocto/meta-ml when you need more control.
+This matters because Rockchip boards are common in robotics/SBC deployments, and RKNN is often the practical way to hit the onboard NPU.
 
 ---
 
-### Android NNAPI (cross-vendor abstraction)
+## 5. Cross-vendor Android abstraction: NNAPI (deprecated, still encountered)
 
-Adding for completeness, across many Android SoCs you also have **[NNAPI](https://developer.android.com/ndk/guides/neuralnetworks)** - a C API that lets higher-level frameworks target hardware accelerators without knowing the vendor details.
+- **NNAPI docs:** https://developer.android.com/ndk/guides/neuralnetworks  
+- **Migration guide:** https://developer.android.com/ndk/guides/neuralnetworks/migration-guide  
 
-**ExecuTorch**, **LiteRT/TFLite**, and **ONNX Runtime** can all delegate to NNAPI when a suitable driver exists. For pure portability across mixed devices, NNAPI is still very valuable (even though it’s being phased out in Android 15 in favor of newer APIs).
-
----
-
-### Apple silicon: MLX + Metal + ANE
-
-We already touched on this, but it’s worth grouping as a “SoC stack”:
-
-* **[MLX](https://github.com/ml-explore/mlx)** gives you NumPy-like arrays, NN layers, optimizers, and JAX-style transforms, all tuned for **Apple’s unified memory + GPU + ANE**.
-
-For laptop-class SoC development, MLX is arguably the most coherent “CUDA-like” experience outside NVIDIA right now: you can do serious training and inference on-device.
+As of Android 15, **the NNAPI NDK API is deprecated**. In practice:
+- Existing devices and drivers still exist, so you may still *encounter* NNAPI.
+- For forward-looking work, prefer **LiteRT delegates** or vendor SDKs directly (QNN, NeuroPilot, etc.).
 
 ---
 
-## 5. Training vs. inference on SoCs: what’s realistic?
+## 6. Training vs inference on SoCs: what’s realistic in early 2026?
 
-### Inference: where SoCs shine today
+### Inference: the default SoC use-case
+SoCs shine at **efficient inference** (power/thermal constraints, on-device privacy).
 
-If you’re deploying **vision, audio, or moderate-size language models** onto SoCs, the current “sane” stack looks roughly like:
+### Training: mostly “lightweight” (with a few real exceptions)
+What’s realistic:
+- Small fine-tunes (adapters/LoRA), small heads, online updates
+- On Apple silicon: MLX makes *real* training/fine-tuning practical on-device
+- On Android/embedded: “on-device training” exists in LiteRT docs, but it’s niche and often bounded to smaller models / specific workflows
 
-* **RB8 / Snapdragon / QRB**
-  -> Train on GPU -> export -> deploy via **QNN SDK** (often through ExecuTorch or ONNX Runtime).
-
-* **TI AM68A / AM69A**
-  -> Train -> export ONNX/TFLite -> compile via **TIDL / Edge AI SDK** -> integrate in GStreamer/OpenVX pipelines.
-
-* **NXP i.MX (e.g., i.MX93)**
-  -> Use **eIQ** with TFLite/ONNX/PyTorch backends; optionally TVM for extra optimization.
-
-* **Generic Android + Mali/Adreno**
-  -> **LiteRT/TFLite or ExecuTorch** with delegates (NNAPI, GPU) for mainstream flows.
-  -> **ncnn** or **TVM/IREE+Vulkan** when you want a custom C++ runtime.
-
-* **Apple silicon**
-  -> **MLX** or Core ML for both training and deployment.
+Most mobile NPUs are still inference-centric from an exposed API standpoint.
 
 ---
 
-### Training: still mostly off-device (with some exceptions)
+## 7. A practical deployment loop that works across SoCs
 
-Full-scale ML training remains firmly in GPU/datacenter land. For SoCs, the realistic training-ish activities are:
+1. **Pick your interchange format**
+   - Android/embedded SoCs: `.tflite` (LiteRT) or `.onnx` (ORT)
+   - Apple: Core ML (`.mlpackage`/`.mlmodel`) via coremltools
+   - LLM edge: GGUF/GGML (llama.cpp) or MLC formats (MLC‑LLM)
 
-* **Lightweight fine-tuning / adapters / LoRA** on ARM CPUs using frameworks backed by **oneDNN** or ACL.
-* Small RL loops or online updates where the heavy network stays fixed and you only adjust a head.
-* On Apple silicon, *real* training with **[MLX](https://ml-explore.github.io/mlx/build/html/index.html)** is now very usable for research-scale models.
+2. **Use the highest-level runtime that still hits your accelerator**
+   - LiteRT delegate / ExecuTorch backend / ORT EP
+   - Vendor SDK when you need max perf-per-watt
 
-NPUs and mobile GPUs are still primarily exposed for inference; training on them is mostly a research topic, not a production pathway.
+3. **Measure delegate/EP coverage**
+   - “Fast path” is only fast if most ops land on the accelerator
+   - Silent fallbacks to CPU are the most common perf surprise
+
+4. **Only drop to Vulkan/OpenCL when you *must***
+   - Custom ops
+   - Research runtimes
+   - You own the full deployment binary and want full control
 
 ---
 
-## 6. Putting it together: a practical “SoC ML stack” mental model
+## Related notes in this repo
 
-If you’re trying to architect something that spans multiple SoCs (RB8 + AM69A + i.MX93, for example), a good mental model is:
+- [Optimizing Models: A Train Of Thought](./OptimizingModels.md) (quantization/pruning/distillation + toolchains)
+- [Model Optimization in 2025-2026: A Survey](./ModelOptDeepDive.md) (SOTA infra + codebases)
 
-1. **Pick a compiler/runtime axis**
-
-   * Use **TVM** or **IREE** where you want a programmable compiler.
-   * Use **ExecuTorch** / **LiteRT** where you want a graph runtime with sane tooling.
-
-2. **Map each deployment to its vendor SDK**
-
-   * Qualcomm -> **QNN SDK**
-   * TI -> **TIDL / Edge AI SDK**
-   * NXP -> **eIQ**
-   * Android phones -> **NNAPI** + GPU / NNAPI / ncnn
-   * Apple -> **MLX / Core ML**
-
-3. **Use low-level APIs only when necessary**
-
-   * Reach for **Vulkan + Kompute** (or raw Vulkan/OpenCL) when you truly need custom kernels or non-standard compute.
-
-4. **Keep CPU as a universal fallback**
-
-   * Backed by **oneDNN** or ACL for dense math.
-   * Plug LLM use-cases into **vLLM** on ARM servers if you can.
-
-That’s about as close as we currently get to “CUDA, but for heterogeneous ARM SoCs”: not one API, but a layered ecosystem you can standardize around.
