@@ -1,13 +1,20 @@
-# A collection of notes on model deployment
+# A collection of notes on model deployment & optimization
 
 This repo is **not** a polished library or a finished survey.  
-It is simply a place where I collect working notes, small experiments, and mental maps around:
+It is a place where I collect working notes, small experiments, and mental maps around *making models run fast* (training, inference, and serving).
+
+---
 
 ## Notes
 
-- [MLSoC.md](./notes/MLSoC.md): tour of the non-CUDA SoC landscape: Vulkan/Kompute, OpenCL, MLX, ARM Compute Library/ARM NN, oneDNN, TVM, IREE, ncnn, ExecuTorch/LiteRT, plus vendor stacks (Qualcomm QNN, TI TIDL, NXP eIQ, NNAPI).
-- [OptimizingModels.md](./notes/OptimizingModels.md): model and edge-level optimization mainstream pathways: quantization (PTQ/QAT, FP8/INT4), pruning/sparsity, distillation, low-rank adapters, and deployment toolchains (TensorRT ModelOpt, Intel INC/OpenVINO, TorchAO, ONNX Runtime, TFLite, TVM, ncnn).
-- [ModelOptDeepDive.md](./notes/ModelOptDeepDive.md): a deeper dive into the **model-side optimization stack** for foundation models, focusing less on edge runtime layers and more on the end-to-end pipeline that makes big models efficient in practice, including weight quantization (INT4/INT8), KV-cache compression, sparsity and sparse kernels, decoding-time acceleration (speculative decoding, multi-head decoding), and high-impact serving kernels and engines (FlashAttention, vLLM, TensorRT-LLM), with pointers to codebases for each component.
+- [MLSoC.md](./notes/MLSoC.md): ML training + inference on **SoCs (non-CUDA landscape)** — Vulkan/Kompute, Metal/Core ML/MLX, **LiteRT** (ex‑TFLite), ExecuTorch, ONNX Runtime, TVM/IREE, ncnn; kernel libs (XNNPACK, oneDNN, Arm Compute Library/Arm NN, CMSIS‑NN, KleidiAI); plus vendor stacks (Qualcomm QNN, TI TIDL, NXP eIQ, etc.) and NNAPI deprecation/migration notes.
+- [OptimizingModels.md](./notes/OptimizingModels.md): a two-layer view of optimization:
+  - **Model-level**: PTQ/QAT quantization (INT8/INT4/FP8/NVFP4), pruning/sparsity, distillation, low-rank/adapters
+  - **Deployment + serving**: NVIDIA **Model Optimizer (ModelOpt)** + TensorRT‑LLM, OpenVINO/NNCF, TorchAO/PT2E, ONNX Runtime, LiteRT, TVM, ncnn; plus “systems wins” (continuous batching, paged KV, chunked prefill, prefix cache) and kernel ecosystems (FlashAttention / FlashInfer).
+- [ModelOptDeepDive.md](./notes/ModelOptDeepDive.md): deeper dive into the “what actually moves latency/throughput” stack for foundation models — weight quant (INT4/INT8/FP8/NVFP4), KV-cache compression/quantization, sparse kernels (incl. 2:4), speculative + multi-token decoding, and high-impact serving kernels/engines (vLLM, TensorRT‑LLM, TGI, SGLang).
+- [PrunaAI.md](./notes/Pruna.md): dedicated note on **Pruna.ai** as an end-to-end model optimization layer (compression search, PTQ/QAT, pruning, distillation, exports, eval loops), with caveats + “what model families it tends to crush”, and comparisons to similar frameworks (ModelOpt, OpenVINO/NNCF, INC, Olive, TorchAO, Optimum, LLM Compressor, etc.).
+
+---
 
 ## Examples
 
@@ -25,8 +32,8 @@ End-to-end optimization pipeline for [2toINF/X-VLA-Libero](https://huggingface.c
 
 **Key findings:**
 - VLM dominates E2E latency (~71%), capping overall gains to ~1.17x
-- PyTorch semi-structured sparsity has overhead; real acceleration requires TensorRT
-- TensorRT provides the most practical speedup path
+- PyTorch semi-structured sparsity has overhead; real acceleration requires TensorRT kernels
+- TensorRT provides the most practical speedup path (for NVIDIA targets)
 
 Scripts: calibration data generation, pruning + quantization build, benchmarking, inference testing.
 
@@ -39,7 +46,26 @@ Benchmarking harness for X-VLA on LIBERO simulation with inference optimizations
 - Flash SDP attention
 - Policy-only latency measurement (isolates model speed from simulation)
 
+### [Pruna SmolVLA Optimization](./examples/pruna-smolvla/)
+
+Practical workflow for optimizing SmolVLA (LeRobot VLA policy) using **Pruna**:
+
+| Method | Status | Notes |
+|--------|--------|-------|
+| TorchAO int8wo | ✅ Works | Weight-only INT8, ~36% memory savings |
+| TorchAO int8dq | ✅ Works | Dynamic INT8 quantization |
+| Half precision | ✅ Works | FP16 conversion |
+| torch.compile | ✅ Works | Graph compilation |
+| HQQ / Pruning | ❌ Fails | Not compatible with SmolVLA in Pruna 0.2.10 |
+
+**Key findings:**
+- INT8 quantization provides reliable memory reduction (~36%) with minimal quality loss
+- INT4 and HQQ are not compatible with SmolVLA's architecture in current Pruna version
+- Structured pruning not supported for SmolVLA
+
+Scripts: calibration data generation, optimization pipeline, benchmarking.
+
 ---
 
-If you are okay with half-baked ideas, TODOs, and rough edges, you might find something useful here.
+If you are okay with half-baked ideas, TODOs, and rough edges, you might find something useful here.  
 If you see something obviously wrong or missing, PRs are all very welcome.
