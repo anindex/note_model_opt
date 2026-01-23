@@ -5,7 +5,7 @@
 **Hanoi, Jan 2026**
 
 *Scope:* **Vision-Language-Action (VLA)** *deployment* (inference-first) for robotics / embodied agents on **edge SoCs** (phones/tablets, laptops-as-edge, SBCs, Jetson-class modules).  
-We covers: (1) model shapes (end-to-end VLA vs split VLM+policy), (2) optimization (quantization, pruning, distillation, cache/scheduling tricks), and (3) runtime lanes (Core ML/ANE, QNN, TensorRT, RKNN, LiteRT/ORT/OpenVINO) + profiling/packaging.  
+We cover: (1) model shapes (end-to-end VLA vs split VLM+policy), (2) optimization (quantization, pruning, distillation, cache/scheduling tricks), and (3) runtime lanes (Core ML/ANE, QNN, TensorRT, RKNN, LiteRT/ORT/OpenVINO) + profiling/packaging.  
 
 ---
 
@@ -25,22 +25,39 @@ We covers: (1) model shapes (end-to-end VLA vs split VLM+policy), (2) optimizati
 
 ---
 
-## 1) Common VLA architectures
+## Living lists for efficient VLA
 
-### A) Autoregressive VLM -> discrete action tokens (common)
+- **Awesome-VLA (includes an “Efficient-VLA” section):** https://github.com/KwanWaiPang/Awesome-VLA
+- **Awesome Efficient VLA (taxonomy + code links):** https://github.com/guanweifan/awesome-efficient-vla
+- **Survey (quick landscape):** *A Survey on Efficient Vision-Language-Action Models* - https://arxiv.org/abs/2510.24795
+
+---
+
+## 1) Reference VLA architectures
+
+### A) Autoregressive VLM -> discrete action tokens
 **Examples:** OpenVLA, SmolVLA, many “token-based” VLAs  
 - Encode image(s) -> visual tokens  
 - Condition on instruction -> decode **action tokens** (often 7–DoF or chunked action sequences)
 - Great for *generalization*, but can be **decode-bound** and **vision-token heavy**.
 
-### B) VLM + diffusion / flow-matching action head (common for smooth actions)
+### B) VLM + diffusion / flow-matching action head
 - VLM provides task context; diffusion/flow head generates continuous actions.
-- Often more sample efficient / smooth, but **multi-step inference** can be too slow unless distilled (see §6).
+- Often more sample efficient / smooth (improving with recent ideas such as [Real-time Action Chunking](https://arxiv.org/abs/2506.07339)), but **multi-step inference** can be too slow unless distilled (see Sec. 6).
 
 ### C) Split pipeline (often the most SoC-friendly)
 - **On-device perception** (small VLM/ViT) + **tiny policy/controller**
 - Optional: off-device LLM “planner” (cloud or nearby GPU)  
 - Sacrifices some end-to-end purity but is usually easier to ship.
+
+### D) Dual-system VLA (slow reasoning + fast control)
+
+This is the “split pipeline” idea *but formalized*: a slow **System 2** reasons, a fast **System 1** executes (often at higher Hz), sometimes with partial parameter sharing.
+
+**Open implementations / references (usable code):**
+- **Fast-in-Slow (FiS-VLA):** https://github.com/CHEN-H01/Fast-in-Slow  (project: https://fast-in-slow.github.io/)
+- **OpenHelix:** https://github.com/OpenHelix-Team/OpenHelix  (project: https://openhelix-robot.github.io/)
+- **Hume:** https://github.com/hume-vla/hume  (project: https://hume-vla.github.io/)
 
 ---
 
@@ -60,7 +77,7 @@ If you’re new: start with **Apple** (fast iteration) or **Jetson** (best “it
 
 ---
 
-## 3) Lane-specific toolchains (links you’ll actually use)
+## 3) Lane-specific toolchains
 
 ### Apple (Core ML + Metal)
 - **Core ML Tools (quantization / pruning / palettization):**  
@@ -114,8 +131,7 @@ If you’re new: start with **Apple** (fast iteration) or **Jetson** (best “it
 
 ---
 
-
-## 3.1 Common model artifacts (what you’ll actually ship)
+## 3.1 Common model artifacts
 
 When people say “deploy the VLA”, it often means producing multiple artifacts:
 
@@ -131,7 +147,7 @@ Practical implication: plan for **multiple conversion + calibration passes**, an
 
 ---
 
-## 3.2 Profiling & debugging (edge reality)
+## 3.2 Profiling & debugging
 
 You’ll want both **latency** and **power/thermals**:
 
@@ -170,29 +186,65 @@ You’ll want both **latency** and **power/thermals**:
 
 ---
 
-### 5.2 NanoVLA (routing + decoupling for edge)
-- Paper: https://arxiv.org/abs/2510.25122  
-- Claims focus on **late fusion** (decouple V/L), **routing**, and **chunking** to reduce edge cost.
+### 5.2 VLA-Adapter (tiny-scale VLA paradigm)
+- Project / paper hub: https://vla-adapter.github.io/
+- Code: https://github.com/OpenHelix-Team/VLA-Adapter  
+- Why it’s useful for edge: focuses on **tiny-scale** designs and practical training/finetuning recipes.
 
 ---
 
-### 5.3 TinyVLA (tiny-scale policy learning)
+### 5.3 NORA (open VLA baseline with released code)
+- Code: https://github.com/declare-lab/nora  
+- Why it’s useful for edge: a practical open VLA codebase/checkpoints you can inspect + benchmark.
+
+---
+
+### 5.4 Evo-1 (lightweight VLA)
+- Code: https://github.com/MINT-SJTU/Evo-1  
+- Why it’s useful for edge: designed for **efficiency** while preserving instruction/vision alignment.
+
+---
+
+### 5.5 EdgeVLA (explicit “edge VLA” experiments)
+- Code: https://github.com/kscalelabs/evla  
+- Why it’s useful for edge: explores training VLAs on **small language models** (e.g., Qwen2-class) and non‑autoregressive objectives.
+
+---
+
+### 5.6 FLOWER (rectified-flow action expert; efficient multi-step policy)
+- Code (CALVIN / LIBERO): https://github.com/intuitive-robots/flower_vla_calvin  
+- Code (pretraining on OXE): https://github.com/intuitive-robots/flower_vla_pret  
+- Why it’s useful for edge: flow-style action heads can be distilled / step-reduced more naturally than long autoregressive decoding.
+
+---
+
+### 5.7 NinA (normalizing-flow action expert; FLOWER variant)
+- Code: https://github.com/dunnolab/NinA  
+- Why it’s useful for edge: swaps diffusion-style sampling for **normalizing flows** to reduce inference cost.
+
+---
+
+### 5.8 NanoVLA (routing + decoupling for edge) - *paper-only*
+- Paper: https://arxiv.org/abs/2510.25122  
+- Useful ideas (even without code): **late fusion** (decouple V/L), **routing**, and **chunking** to reduce edge cost.
+
+---
+
+### 5.9 TinyVLA (tiny-scale policy learning)
 - Paper: https://arxiv.org/abs/2409.12514  
 - Code: https://github.com/JayceWen/tinyvla
 
 ---
 
-### 5.4 RoboMamba (state-space / Mamba-style efficiency)
+### 5.10 RoboMamba (state-space / Mamba-style efficiency)
 - Paper: https://arxiv.org/abs/2406.04339  
 - Project: https://robomamba.github.io/
 
 ---
 
-### 5.5 MoLe‑VLA (dynamic layer skipping)
+### 5.11 MoLe‑VLA (dynamic layer skipping)
 - Paper: https://arxiv.org/abs/2503.20384  
 - Code: https://github.com/RoyZry98/MoLe-VLA-Pytorch
-
----
 
 ## 6) Optimization playbook (SoC-focused)
 
@@ -205,7 +257,7 @@ Track **control-loop metrics**:
 
 ### Step 1 - Make the model “edge-shaped”
 Low-risk levers:
-- Reduce **image resolution** (e.g., $224^2$ -> $160^2$) *if success rate holds*
+- Reduce **image resolution** (e.g., 224² -> 160²) *if success rate holds*
 - Reduce **frame rate** and use **action chunking**
 - Prefer **single image** or a small temporal window (avoid long video token streams)
 - Enforce **static shapes** where your compiler needs it (QNN / TensorRT / Core ML)
@@ -217,6 +269,7 @@ Low-risk levers:
 
 Apple note: Core ML tools explicitly supports **4-bit and 8-bit weight quantization** (and optional 8-bit activations).  
 Qualcomm note: QNN compilation/EP often expects **quantized** graphs to reach NPU speedups.
+- **Combined quant + token pruning (training-free):** SQAP‑VLA - https://arxiv.org/abs/2509.09090 (code: https://github.com/ecdine/SQAP-VLA)
 
 ### Step 3 - Cut visual tokens (often the biggest latency win)
 Common patterns:
@@ -224,12 +277,13 @@ Common patterns:
 - Token caching across frames (robotics has high temporal redundancy)
 - Late fusion / decoupling so you can reuse parts
 
-Representative papers (mostly training-free):
-- **Token caching:** VLA‑Cache - https://arxiv.org/abs/2502.02175 (code: https://github.com/siyuhsu/vla-cache)
-- **Dual-level pruning:** VLA‑Pruner - https://arxiv.org/abs/2511.16449  
-- **Self-speculative pruning:** SpecPrune‑VLA - https://arxiv.org/abs/2509.05614  
-- **Instruction-guided token compression:** Compressor‑VLA - https://arxiv.org/abs/2511.18950  
-- **Driving-focused pruning:** FastDriveVLA - https://arxiv.org/abs/2507.23318
+Actionable starting points (with code):
+- **Token caching across frames:** VLA‑Cache - https://arxiv.org/abs/2502.02175 (code: https://github.com/siyuhsu/vla-cache)
+- **Quantization-aware pruning + token pruning:** SQAP‑VLA - https://arxiv.org/abs/2509.09090 (code: https://github.com/ecdine/SQAP-VLA)
+
+If you want a longer (fast-changing) list, start from:
+- https://github.com/KwanWaiPang/Awesome-VLA (see “Efficient‑VLA”)
+- https://github.com/guanweifan/awesome-efficient-vla
 
 ### Step 4 - Make action tokens efficient (quality + speed)
 If action discretization is hurting dexterity or sequence length:
@@ -237,8 +291,10 @@ If action discretization is hurting dexterity or sequence length:
 - **Vector-quantized action tokenizers:** VQ‑VLA - https://arxiv.org/abs/2507.01016 (code: https://github.com/xiaoxiao0406/VQ-VLA)
 
 ### Step 5 - Reduce decoding overhead
-- **Parallel decoding for action chunking:** PD‑VLA - https://arxiv.org/abs/2503.02310  
-- **Early exit decoding / consistency-style:** CEED‑VLA - https://arxiv.org/abs/2506.13725
+- **Parallel decoding for action chunking:** PD‑VLA - https://arxiv.org/abs/2503.02310 (*paper-only; use as an idea bucket*)
+- **Early-exit decoding + consistency distillation:** CEED‑VLA - https://arxiv.org/abs/2506.13725  
+  Code: https://github.com/OpenHelix-Team/CEED-VLA  
+  Project: https://irpn-eai.github.io/CEED-VLA/
 
 ### Step 6 - If you have diffusion policies, distill them
 Multi-step diffusion is often the blocker for real-time on SoCs.
@@ -249,7 +305,7 @@ Multi-step diffusion is often the blocker for real-time on SoCs.
 
 ---
 
-## 7) Minimal deployment checklist (use this before you “optimize”)
+## 7) Minimal deployment checklist (refer this before you “start optimizing”)
 
 1. **Choose runtime target per submodule** (vision / language / action head)  
 2. Confirm **supported ops & shapes** (QNN/Core ML/TensorRT)  
