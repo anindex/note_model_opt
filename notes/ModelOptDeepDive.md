@@ -34,6 +34,8 @@ Everything below maps to one or more of those bottlenecks.
   (AutoGPTQ is archived/unmaintained; GPTQModel is the common maintained path now.)
 - **AWQ:** [mit-han-lab/llm-awq](https://github.com/mit-han-lab/llm-awq)  
   Common “accurate INT4” choice when you can calibrate quickly.
+-- **EXL2 quantization** [Turboderp] (https://github.com/turboderp-org/exllamav3)
+  (ExLlamaV3 aims to address this with the EXL3 format, which is a streamlined variant of QTIP from Cornell RelaxML)
 
 **Docs that matter (format + runtime support)**
 - **Transformers quantization guide (GPTQ/AWQ/bitsandbytes):** https://huggingface.co/docs/transformers/en/main_classes/quantization
@@ -89,6 +91,8 @@ Rule of thumb:
   Repo: https://github.com/pytorch/ao
 - **compressed-tensors (unified checkpoint format for quant + sparsity variants):**  
   HF docs: https://huggingface.co/docs/transformers/en/quantization/compressed_tensors
+- **vector-quantize-pytorch (VQ building blocks for training):**
+  Repo: https://github.com/lucidrains/vector-quantize-pytorch
 
 ---
 
@@ -111,6 +115,8 @@ Useful when INT4 is not enough, or for edge/local constraints (but kernels decid
 - **AutoRound:** https://github.com/intel/auto-round
 - **AQLM:** https://github.com/Vahe1994/AQLM
 - **HQQ:** https://github.com/dropbox/hqq
+- **HAWQ:** https://github.com/Zhen-Dong/HAWQ
+  - *Hessian AWare Quantization (mixed-precision sensitivity analysis).*
 
 **Discussion: reality of 2–3 bits**
 - Accuracy is workload-dependent → validate on real prompts.
@@ -231,6 +237,39 @@ https://docs.openvino.ai/2024/ovms_demos_continuous_batching.html)
 If you want a standard serving layer + batching + observability, Triton often sits above the engine:
 - **TensorRT-LLM backend:** https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/tensorrtllm_backend/README.html
 - **vLLM backend:** https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/vllm_backend/README.html
+
+### 5.5 Profiling Tools
+
+- **CUTracer:** https://github.com/facebookresearch/CUTracer
+  - *A lightweight CUDA kernel tracer for functional correctness debugging and performance profiling.*
+- **ExCa:** https://github.com/facebookresearch/exca
+  - *Execution Cascade Analysis: A tool for analyzing CUDA execution graphs.*
+- **Kineto:** https://github.com/pytorch/kineto
+  - *Holistic Performance Analysis of AI Workloads on GPUs.*
+- **cuGraph:** https://github.com/rapidsai/cugraph
+  - *RAPIDS Graph Analytics Library (profiling/analysis utilities).*
+- **NVBit:** https://github.com/NVlabs/NVBit
+  - *NVIDIA Binary Instrumentation Tool for dynamic analysis of CUDA kernels.*
+- **CUPTI:** https://developer.nvidia.com/cupti
+  - *The CUDA Profiling Tools Interface (foundational profiling API).*
+- **ONNX Runtime Profiling Tools:** https://onnxruntime.ai/docs/performance/tune-performance/profiling-tools.html
+  - *Integrated performance profiling for ONNX Runtime (CPU/GPU/NPU).*
+- **Qualcomm Profiler:** https://www.qualcomm.com/developer/software/qualcomm-profiler
+  - *System and kernel-level profiling for Snapdragon SoCs (Hexagon NPU/Adreno GPU).*
+
+### 5.6 Vision Kernels (Preprocessing)
+- **CV-CUDA:** https://github.com/CVCUDA/CV-CUDA
+  - *High-performance GPU-accelerated computer vision (image processing/augmentation) kernels.*
+
+### 5.7 GEMM Optimization
+- **CUDA-GEMM-Optimization:** https://github.com/leimao/CUDA-GEMM-Optimization
+  - *Detailed tutorials and implementations for optimizing FP32/FP16 matmul on CUDA.*
+
+### 5.8 Transformer Layer Optimizations
+- **PyTorch BetterTransformer:** https://pytorch.org/blog/a-better-transformer-for-fast-transformer-encoder-inference/
+  - *PyTorch-native fast path for TransformerEncoder/Decoder (sparsity + fusion).*
+- **Qualcomm Efficient Transformers:** https://github.com/quic/efficient-transformers
+  - *Optimized Transformer primitives (often edge/mobile focused).*
 
 **Practical serving mindset**
 1. Optimize utilization first: batching, KV management, prefill vs decode scheduling.

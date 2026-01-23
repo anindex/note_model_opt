@@ -195,6 +195,16 @@ If your *main* workload is **LLM inference on edge/mobile**:
 - **MNN:** https://github.com/alibaba/MNN  
   Lightweight engine with strong on-device focus (and a lot of real-world Android usage inside Alibaba’s ecosystem).
 
+- **CTranslate2:** https://github.com/OpenNMT/CTranslate2
+  CTranslate2 is a C++ and Python library for efficient inference with Transformer models.
+
+- **PowerInfer:**: https://github.com/SJTU-IPADS/PowerInfer
+  Fast Large Language Model Serving with a Consumer-grade GPU
+
+- **mllm:**: https://github.com/UbiquitousLearning/mllm
+  Fast and lightweight multimodal LLM inference engine for mobile and edge devices
+
+
 ---
 
 ## 4. Vendor SoC stacks: “CUDA for X”
