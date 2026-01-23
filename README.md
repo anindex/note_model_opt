@@ -8,6 +8,7 @@ It is a place where I collect working notes, small experiments, and mental maps 
 ## Notes
 
 - [MLSoC.md](./notes/MLSoC.md): ML training + inference on **SoCs (non-CUDA landscape)** — Vulkan/Kompute, Metal/Core ML/MLX, **LiteRT** (ex‑TFLite), ExecuTorch, ONNX Runtime, TVM/IREE, ncnn; kernel libs (XNNPACK, oneDNN, Arm Compute Library/Arm NN, CMSIS‑NN, KleidiAI); plus vendor stacks (Qualcomm QNN, TI TIDL, NXP eIQ, etc.) and NNAPI deprecation/migration notes.
+- [VLAonSocs.md](./notes/VLAonSocs.md): focusing on **VLA deployment on SoCs** (robotics/embodied) - end-to-end VLA vs VLM+policy, quant/prune/distill, caching/scheduling tricks, and device lanes (Core ML/ANE, QNN, TensorRT, RKNN, LiteRT/ORT, MLC/llama.cpp) + profiling/packaging checklist.
 - [OptimizingModels.md](./notes/OptimizingModels.md): a two-layer view of optimization:
   - **Model-level**: PTQ/QAT quantization (INT8/INT4/FP8/NVFP4), pruning/sparsity, distillation, low-rank/adapters
   - **Deployment + serving**: NVIDIA **Model Optimizer (ModelOpt)** + TensorRT‑LLM, OpenVINO/NNCF, TorchAO/PT2E, ONNX Runtime, LiteRT, TVM, ncnn; plus “systems wins” (continuous batching, paged KV, chunked prefill, prefix cache) and kernel ecosystems (FlashAttention / FlashInfer).
