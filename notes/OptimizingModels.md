@@ -328,6 +328,7 @@ These are often the fastest way to get something working across laptops + edge b
 Two big levers:
 - **Reduce steps** (often bigger win than faster steps): Latent Consistency Models (LCM): [luosiallen/latent-consistency-model][lcm]
 - **Make each step faster** (quantize/compile kernels):
+  - SVDQuant (4-bit diffusion via low-rank outlier absorption): [arXiv:2411.05007][svdquant]
   - Diffusers bitsandbytes quantization guide: [Diffusers bitsandbytes quantization][diffusers-bnb]
   - Reference implementations / research code: [Stability-AI/generative-models][stability-generative-models]
 
@@ -453,5 +454,6 @@ Two big levers:
 
 <!-- Diffusion / VLM extras -->
 [lcm]: https://github.com/luosiallen/latent-consistency-model
+[svdquant]: https://arxiv.org/abs/2411.05007
 [diffusers-bnb]: https://huggingface.co/docs/diffusers/en/quantization/bitsandbytes
 [stability-generative-models]: https://github.com/Stability-AI/generative-models
