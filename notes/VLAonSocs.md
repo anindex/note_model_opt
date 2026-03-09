@@ -142,6 +142,7 @@ When people say “deploy the VLA”, it often means producing multiple artifact
 - **TensorRT engines** (`.plan`) - Jetson GPU-optimized engines (build on-device or in matching containers)
 - **RKNN / RKLLM formats** - Rockchip-converted assets for NPU/runtime
 - **GGUF / GGML-family** - CPU/GPU inference stacks like llama.cpp (useful for LLM-only subsystems)
+- **1-bit quantized (BitNet)** - extreme CPU-only quantization for LLM backbones; requires QAT retraining but delivers massive speedups + energy savings (Microsoft BitNet b1.58 ecosystem)
 
 Practical implication: plan for **multiple conversion + calibration passes**, and budget time for “op coverage” debugging.
 
@@ -246,6 +247,10 @@ You’ll want both **latency** and **power/thermals**:
 - Paper: https://arxiv.org/abs/2503.20384  
 - Code: https://github.com/RoyZry98/MoLe-VLA-Pytorch
 
+### 5.12 SimVLA (minimal design)
+- Paper: https://arxiv.org/pdf/2602.18224
+- Code: https://github.com/LUOyk1999/SimVLA
+
 ## 6) Optimization playbook (SoC-focused)
 
 ### Step 0 - Measure end-to-end (not just tokens/sec)
@@ -269,6 +274,12 @@ Low-risk levers:
 
 Apple note: Core ML tools explicitly supports **4-bit and 8-bit weight quantization** (and optional 8-bit activations).  
 Qualcomm note: QNN compilation/EP often expects **quantized** graphs to reach NPU speedups.
+
+VLA-specific quantization (recommended first step):
+- **Scale-Calibrated Post-Training Quantization for VLA:** QuantVLA - https://arxiv.org/abs/2602.20309
+
+CPU-only edge note: for **CPU-only edge deployment** (no GPU/NPU), consider **1-bit quantization (BitNet b1.58)** if you can retrain: massive speedups (2.37x–6.17x on x86, 1.37x–5.07x on ARM) + energy savings (72–82% on x86, 55–70% on ARM). See [microsoft/BitNet][bitnet-repo] and OptimizingModels note.
+
 - **Combined quant + token pruning (training-free):** SQAP‑VLA - https://arxiv.org/abs/2509.09090 (code: https://github.com/ecdine/SQAP-VLA)
 
 ### Step 3 - Cut visual tokens (often the biggest latency win)
@@ -281,6 +292,10 @@ Actionable starting points (with code):
 - **Token caching across frames:** VLA‑Cache - https://arxiv.org/abs/2502.02175 (code: https://github.com/siyuhsu/vla-cache)
 - **Quantization-aware pruning + token pruning:** SQAP‑VLA - https://arxiv.org/abs/2509.09090 (code: https://github.com/ecdine/SQAP-VLA)
 
+Efficient token importance estimation (kernel library):
+- **Flash-ColReduce:** Triton kernels for column-wise attention reductions (sum/mean/max) with O(N) memory instead of O(N²); identifies which tokens matter most without materializing full attention; used in visual token pruning (e.g., SparseVILA).
+  Code: https://github.com/z-lab/flash-colreduce
+
 If you want a longer (fast-changing) list, start from:
 - https://github.com/KwanWaiPang/Awesome-VLA (see “Efficient‑VLA”)
 - https://github.com/guanweifan/awesome-efficient-vla
@@ -292,13 +307,27 @@ If action discretization is hurting dexterity or sequence length:
 
 ### Step 5 - Reduce decoding overhead
 - **Parallel decoding for action chunking:** PD‑VLA - https://arxiv.org/abs/2503.02310 (*paper-only; use as an idea bucket*)
-- **Early-exit decoding + consistency distillation:** CEED‑VLA - https://arxiv.org/abs/2506.13725  
-  Code: https://github.com/OpenHelix-Team/CEED-VLA  
+- **Early-exit decoding + consistency distillation:** CEED‑VLA - https://arxiv.org/abs/2506.13725
+  Code: https://github.com/OpenHelix-Team/CEED-VLA
   Project: https://irpn-eai.github.io/CEED-VLA/
 
+VLM-heavy VLA note (if you have a large language decoder):
+- **Block diffusion parallel drafting :**  DFlash
+  Code: https://github.com/z-lab/dflash
+
 ### Step 6 - If you have diffusion policies, distill them
-Multi-step diffusion is often the blocker for real-time on SoCs.
+Multi-step diffusion is often the blocker for real-time on SoCs. Two complementary approaches:
+
+**Model-side (distillation):**
 - **One-step diffusion distillation:** OneDP - https://arxiv.org/abs/2410.21257 (project: https://research.nvidia.com/labs/dir/onedp/)
+- **Fast Generation from Diffusion Models:** NVIDIA FastGen
+  Code: https://github.com/NVlabs/FastGen
+
+**Serving-side (inference optimization):**
+- **PyTorch-native and Flexible Inference Engine with Hybrid Cache Acceleration and Parallelism for DiTs:** Cache-DiT
+  Code: https://github.com/vipshop/cache-dit
+- **From Instantaneous to Average Velocity for Accelerating Flow Matching Inference:** MeanCache - https://arxiv.org/pdf/2601.19961
+  Code: https://github.com/UnicomAI/MeanCache
 
 ### Step 7 - If you just need a faster expert, distill the VLA
 - **Refined Policy Distillation (RL refinement to compact expert):** https://arxiv.org/abs/2503.05833
@@ -338,3 +367,5 @@ while robot.is_running():
 
 - For broader “SoC ML stacks” (training + inference, runtimes, compilers): see **ML Training & Inference on SoCs**.
 - For model compression theory/practice (quant/prune/distill): see the **Optimizing Models** notes.
+
+---

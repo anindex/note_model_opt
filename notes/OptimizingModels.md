@@ -31,14 +31,14 @@ Common variants (esp. for transformers) (survey: [Zhu et al., 2024][survey-llm-c
   - SmoothQuant: [mit-han-lab/smoothquant][smoothquant]
   - AWQ: [mit-han-lab/llm-awq][awq]
 
-- **Quantization-Aware Training (QAT)**  
+- **Quantization-Aware Training (QAT)**
   Simulate quantization during fine-tuning to recover accuracy when PTQ is too lossy.
   - PyTorch-native QAT for low-bit: [torchao QAT docs][torchao-qat]
   - NVIDIA QAT workflows (for TensorRT/TensorRT-LLM): [Model Optimizer docs][modelopt-docs]
 
 - **Mixed precision & vendor-specific formats**
   - Mixed FP16/BF16 is the default “cheap win.”
-  - NVIDIA-specific low-bit floats: **FP8** and **NVFP4/FP4** are supported through **TensorRT** + **NVIDIA Model Optimizer (ModelOpt)**.  
+  - NVIDIA-specific low-bit floats: **FP8** and **NVFP4/FP4** are supported through **TensorRT** + **NVIDIA Model Optimizer (ModelOpt)**.
     Practical entry points: [NVFP4 overview][nvfp4-blog], [TensorRT quantized types][tensorrt-quantized-types].
 
 > Reality check: the *format* only matters if your deployment stack has the matching kernels (this is where TensorRT-LLM / TensorRT / OpenVINO / ORT / LiteRT differ).
@@ -132,7 +132,7 @@ Pre-quantized checkpoints:
 For Intel CPUs/GPUs and many industrial deployments, the “mainline” path today is:
 
 - **OpenVINO** as the inference runtime: [OpenVINO toolkit][openvino]
-- **NNCF** as the compression backend (PTQ/QAT/weight compression):  
+- **NNCF** as the compression backend (PTQ/QAT/weight compression):
   - Docs: [OpenVINO model optimization (NNCF)][openvino-modelopt]
   - Repo: [openvinotoolkit/nncf][nncf-repo]
 
@@ -165,9 +165,9 @@ Pruning in “vanilla PyTorch”:
 
 Common choices across heterogeneous edge targets:
 
-- **ONNX Runtime** (quantization + graph optimizations):  
+- **ONNX Runtime** (quantization + graph optimizations):
   - ORT quantization docs: [onnxruntime.ai quantization guide][ort-quant]
-- **LiteRT** (formerly TensorFlow Lite) for mobile/embedded:  
+- **LiteRT** (formerly TensorFlow Lite) for mobile/embedded:
   - Overview: [ai.google.dev/edge/litert][litert]
   - GitHub: [google-ai-edge/LiteRT][litert-repo]
 - **Apache TVM** (compiler + autotuning): [tvm.apache.org][tvm]
@@ -230,11 +230,11 @@ If you do nothing else, choose a serving engine that gives you:
 - optional **chunked prefill** (smooths very long prompts)
 
 Good entry points:
-- **vLLM**: PagedAttention + continuous batching + CUDA/HIP graph execution.  
+- **vLLM**: PagedAttention + continuous batching + CUDA/HIP graph execution.
   Docs: [vLLM docs][vllm-docs] · Repo: [vllm-project/vllm][vllm-repo]
-- **Hugging Face Text Generation Inference (TGI)**: production server with dynamic batching + tensor parallelism.  
+- **Hugging Face Text Generation Inference (TGI)**: production server with dynamic batching + tensor parallelism.
   Docs: [TGI docs][tgi-docs] · Repo: [huggingface/text-generation-inference][tgi-repo]
-- **SGLang**: high-performance LLM serving framework + runtime stack.  
+- **SGLang**: high-performance LLM serving framework + runtime stack.
   Repo: [sgl-project/sglang][sglang-repo]
 
 > Reality check: feature parity differs (quant formats, speculative decoding, MoE, multi-modal, etc.).  
@@ -245,7 +245,7 @@ Good entry points:
 For transformer-heavy workloads, **attention + MLP kernels** are usually the make-or-break.
 
 - **FlashAttention** (training + inference attention kernels): [Dao-AILab/flash-attention][flashattn]
-- **FlashInfer** (serving-focused kernels: attention, paged attention, sampling, etc.):  
+- **FlashInfer** (serving-focused kernels: attention, paged attention, sampling, etc.):
   Repo: [flashinfer-ai/flashinfer][flashinfer] · Docs: [flashinfer.ai docs][flashinfer-docs]
 
 ### 3.3 KV-cache optimization for long context + high concurrency
@@ -260,11 +260,17 @@ Researchy-but-usable codebases:
 - **KVQuant**: [SqueezeAILab/KVQuant][kvquant]
 - **ZipCache**: [ThisisBillhe/ZipCache][zipcache]
 
+Kernel library for efficient pruning decisions:
+- **Flash-ColReduce**: Triton kernels for attention column-wise reductions (sum/mean/max) with O(N) memory; enables efficient token/KV importance estimation without materializing O(N²) attention matrix.
+  Repo: [z-lab/flash-colreduce][flash-colreduce]
+
 ### 3.4 Decoding acceleration (reduce target-model forward passes)
 
 If decode is the bottleneck, you can reduce the number of expensive target-model steps:
 - **Speculative decoding** (draft model + verification): [romsto/Speculative-Decoding][specdec]
 - **Multi-token heads** (Medusa): [FasterDecoding/Medusa][medusa]
+- **Block diffusion parallel drafting** (DFlash): lightweight diffusion-based draft model generating multiple tokens in parallel; proven on Qwen/Llama/GPT-OSS; benefits LLM serving + high concurrency.
+  Repo: [z-lab/dflash][dflash]
 
 ---
 
@@ -272,15 +278,21 @@ If decode is the bottleneck, you can reduce the number of expensive target-model
 
 ### NVIDIA GPUs / Jetson / Blackwell-class
 
-- **NVIDIA Model Optimizer (ModelOpt)** for PTQ/QAT + sparsity/distillation:  
+- **NVIDIA Model Optimizer (ModelOpt)** for PTQ/QAT + sparsity/distillation:
   Docs: [ModelOpt docs][modelopt-docs] · Repo: [NVIDIA/Model-Optimizer][modelopt-repo]
-- **TensorRT-LLM** for engine build + kernels + serving:  
+- **TensorRT-LLM** for engine build + kernels + serving:
   Docs: [TensorRT-LLM docs][tensorrt-llm-docs] · Repo: [NVIDIA/TensorRT-LLM][tensorrt-llm-repo]
+
+- **embedl-models** (pre-optimized model collection):
+  Repo: [embedl/embedl-models][embedl-models]
+
+- **NTransformer** (inference engine for limited VRAM):
+  Repo: [xaskasdf/ntransformer][ntransformer]
 
 ### AMD GPUs (ROCm/HIP) + non-NVIDIA datacenter
 
 - Serving engines like **vLLM** can run with **HIP** backends; quantization support is more kernel-dependent and can be narrower than NVIDIA.
-- PyTorch **torch.compile** (Inductor) is a good “graph+kernel” optimization baseline across NVIDIA/AMD/Intel GPUs (via Triton):  
+- PyTorch **torch.compile** (Inductor) is a good “graph+kernel” optimization baseline across NVIDIA/AMD/Intel GPUs (via Triton):
   API: [torch.compile][torch-compile] · Guide: [torch.compiler docs][torch-compiler-guide]
 
 ### CPUs (x86 + ARM servers)
@@ -293,6 +305,7 @@ Runtimes:
 - **ONNX Runtime** (cross-platform): [ORT quantization docs][ort-quant]
 - **ONNX Runtime GenAI** (generation loop tooling): [microsoft/onnxruntime-genai][ort-genai]
 - **llama.cpp** (local C++ inference; GGUF ecosystem): [ggml-org/llama.cpp][llamacpp]
+- **BitNet.cpp** (1-bit LLM inference on CPU): [microsoft/BitNet][bitnet-repo]
 
 ### Apple silicon (laptop / mobile-class SoC)
 
@@ -302,8 +315,8 @@ Runtimes:
 
 ### Android / Qualcomm / embedded SoCs
 
-- **LiteRT** (ex-TFLite) runtime + delegates:  
-  Docs: [LiteRT][litert] · Repo: [google-ai-edge/LiteRT][litert-repo] · Samples: [litert-samples][litert-samples]  
+- **LiteRT** (ex-TFLite) runtime + delegates:
+  Docs: [LiteRT][litert] · Repo: [google-ai-edge/LiteRT][litert-repo] · Samples: [litert-samples][litert-samples]
   LLM pipeline: [google-ai-edge/LiteRT-LM][litert-lm]
 - **ExecuTorch** (PyTorch -> on-device runtime): [Docs][executorch] · [Repo][executorch-repo]
 - **ONNX Runtime + QNN EP** (Qualcomm acceleration): [ORT QNN EP docs][ort-qnn] · [Qualcomm ORT QNN EP docs][qnn-ort-docs]
@@ -325,11 +338,22 @@ These are often the fastest way to get something working across laptops + edge b
 
 ### Diffusion / image generation
 
-Two big levers:
-- **Reduce steps** (often bigger win than faster steps): Latent Consistency Models (LCM): [luosiallen/latent-consistency-model][lcm]
+**Model-side levers (reduce steps or faster steps):**
+- **Reduce steps** (often biggest win): Latent Consistency Models (LCM): [luosiallen/latent-consistency-model][lcm]
 - **Make each step faster** (quantize/compile kernels):
+  - SVDQuant (4-bit diffusion via low-rank outlier absorption): [arXiv:2411.05007][svdquant]
   - Diffusers bitsandbytes quantization guide: [Diffusers bitsandbytes quantization][diffusers-bnb]
   - Reference implementations / research code: [Stability-AI/generative-models][stability-generative-models]
+
+**Distillation frameworks (end-to-end model compression):**
+- **Fast Generation from Diffusion Models**: FastGen
+  Repo: [NVlabs/FastGen][fastgen]
+
+**Serving-time optimization (inference-time caching, not training-based):**
+- **PyTorch-native and Flexible Inference Engine with Hybrid Cache Acceleration and Parallelism for DiTs:** Cache-DiT
+  Repo: [vipshop/cache-dit][cache-dit]
+- **From Instantaneous to Average Velocity for Accelerating Flow Matching Inference:** MeanCache
+  Paper: [ICLR 2026][meancache-paper] · Repo: [UnicomAI/MeanCache][meancache]
 
 ---
 
@@ -356,6 +380,8 @@ Two big levers:
 <!-- Quantization methods -->
 [smoothquant]: https://github.com/mit-han-lab/smoothquant
 [awq]: https://github.com/mit-han-lab/llm-awq
+[bitnet-repo]: https://github.com/microsoft/BitNet
+[bitnet-paper]: https://arxiv.org/abs/2310.11453
 
 <!-- NVIDIA stacks  -->
 [modelopt-repo]: https://github.com/NVIDIA/Model-Optimizer
@@ -365,6 +391,8 @@ Two big levers:
 [tensorrt-quantized-types]: https://docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/work-quantized-types.html
 [nvfp4-blog]: https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/
 [modelopt-hf-collection]: https://huggingface.co/collections/nvidia/inference-optimized-checkpoints-with-model-optimizer
+[embedl-models]: https://github.com/embedl/embedl-models
+[ntransformer]: https://github.com/xaskasdf/ntransformer
 
 <!-- Sparsity -->
 [cusparselt]: https://docs.nvidia.com/cuda/cusparselt/
@@ -423,8 +451,10 @@ Two big levers:
 <!-- KV cache + decoding acceleration -->
 [kvquant]: https://github.com/SqueezeAILab/KVQuant
 [zipcache]: https://github.com/ThisisBillhe/ZipCache
+[flash-colreduce]: https://github.com/z-lab/flash-colreduce
 [specdec]: https://github.com/romsto/Speculative-Decoding
 [medusa]: https://github.com/FasterDecoding/Medusa
+[dflash]: https://github.com/z-lab/dflash
 
 <!-- PyTorch compile / export -->
 [torch-compile]: https://docs.pytorch.org/docs/stable/generated/torch.compile.html
@@ -453,5 +483,12 @@ Two big levers:
 
 <!-- Diffusion / VLM extras -->
 [lcm]: https://github.com/luosiallen/latent-consistency-model
+[svdquant]: https://arxiv.org/abs/2411.05007
 [diffusers-bnb]: https://huggingface.co/docs/diffusers/en/quantization/bitsandbytes
 [stability-generative-models]: https://github.com/Stability-AI/generative-models
+[cache-dit]: https://github.com/vipshop/cache-dit
+[meancache]: https://github.com/UnicomAI/MeanCache
+[meancache-paper]: https://openreview.net/forum?id=RyFz3vF6mH
+[quantvla-paper]: https://arxiv.org/abs/2602.20309
+[quantvla]: https://quantvla.github.io/
+[fastgen]: https://github.com/NVlabs/FastGen
